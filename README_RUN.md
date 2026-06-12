@@ -1,5 +1,60 @@
 # Horizon Institutional Lab
 
+## Superbot Trading Lab
+
+Superbot is a testnet-first trading lab. In plain English, it watches crypto market data, looks for short-term mean-reversion opportunities, checks whether each idea is safe enough to test, learns from trade outcomes, and records every important action.
+
+The web dashboard is optional. The backend can run headless on an Ubuntu droplet through systemd workers, while the UI simply renders status, signals, charts, audit events, and install guidance.
+
+```mermaid
+flowchart LR
+    A["Public Exchange APIs<br/>Prices, candles, order book,<br/>funding, open interest"] --> B["Market Data Worker<br/>Normalize and publish latest state"]
+    B --> C["Signal Worker<br/>Mean-reversion candidates<br/>feature snapshots"]
+    C --> D["Risk + ML Workers<br/>Risk gates, drift checks,<br/>confidence score"]
+    D --> E["Order Worker<br/>Paper/Testnet requests<br/>final risk re-check"]
+    E --> F["P&L Worker<br/>Positions, exits,<br/>realized performance"]
+
+    B <--> R["Redis<br/>latest state, locks,<br/>pub/sub, worker health"]
+    C --> M["MariaDB<br/>signals, requests,<br/>orders, positions, P&L,<br/>model registry, audit log"]
+    D --> M
+    E --> M
+    F --> M
+    U["Streamlit UI<br/>optional dashboard"] --> R
+    U --> M
+```
+
+## Quick Ubuntu Install
+
+Use Ubuntu `24.04 LTS` for production. Keep real secrets out of GitHub.
+
+```bash
+sudo apt-get update
+sudo apt-get install -y git
+
+git clone https://github.com/kaniampurath/superbot.git /home/myts/superbot
+cd /home/myts/superbot
+
+cp .env.production.example horizon-prod.env
+nano horizon-prod.env
+chmod 600 horizon-prod.env
+
+bash scripts/install_ubuntu.sh --check --app-dir /home/myts/superbot --app-user myts --env-file horizon-prod.env
+sudo bash scripts/install_ubuntu.sh --app-dir /home/myts/superbot --app-user myts --env-file horizon-prod.env
+
+sudo systemctl start horizon-backend
+sudo systemctl start horizon-ui
+bash scripts/healthcheck_ubuntu.sh
+```
+
+Minimum env values:
+
+| Setting | Purpose | Required |
+|---|---|---|
+| `MYSQL_PASSWORD` | Database password for the app user | Yes |
+| `MYSQL_ROOT_PASSWORD` | MariaDB root password | Yes |
+| `ENABLE_REAL_TESTNET_ORDERS` | Set `false` until Testnet credentials are ready | Yes |
+| `testnet_key` / `testnet_secret` | Binance Spot Testnet credentials | Only when Testnet orders are enabled |
+
 ## What This System Is
 `horizon_institutional_lab` is a local crypto mispricing feasibility and validation lab. It combines Binance public market data, a composite alpha model, risk gates, paper deployment, audit logging, and a Streamlit institutional dashboard.
 
