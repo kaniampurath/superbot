@@ -1780,6 +1780,97 @@ def production_progress_chart(state: RedisState, rows: list[dict[str, Any]], val
     return fig
 
 
+def render_home_page(st: Any) -> None:
+    from streamlit.components.v1 import html
+
+    st.title("Superbot Trading Lab")
+    st.caption("A testnet-first trading system that collects market data, scores opportunities, checks risk, learns from outcomes, and can run without the web screen.")
+
+    left, right = st.columns([1.2, 1])
+    with left:
+        st.subheader("What it does")
+        st.markdown(
+            """
+            Superbot watches public crypto market data, looks for short-term mean-reversion setups, checks whether the idea is safe enough to test, and records every decision in MariaDB.
+
+            The dashboard is only a window into the system. The backend workers can keep running headless on an Ubuntu droplet.
+            """
+        )
+    with right:
+        st.subheader("Current operating mode")
+        st.metric("Stage", CFG.system_stage.upper())
+        st.metric("Symbols", str(len(CFG.symbols)))
+        st.metric("Testnet Orders", "Enabled" if CFG.enable_real_testnet_orders else "Disabled")
+
+    html(
+        """
+        <style>
+          .arch-wrap{font-family:Arial,sans-serif;border:1px solid #d7dee8;border-radius:8px;padding:18px;background:#fbfdff}
+          .arch-title{font-weight:700;color:#0f172a;margin-bottom:12px;font-size:18px}
+          .arch-grid{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;align-items:stretch}
+          .arch-card{border:1px solid #ccd6e2;border-radius:8px;background:white;padding:12px;min-height:98px}
+          .arch-card b{display:block;color:#0f172a;margin-bottom:6px}
+          .arch-card span{display:block;color:#475569;font-size:13px;line-height:1.35}
+          .arch-arrow{text-align:center;color:#2563eb;font-weight:700;padding-top:38px}
+          .arch-store{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
+          .arch-note{margin-top:12px;color:#334155;font-size:13px}
+        </style>
+        <div class="arch-wrap">
+          <div class="arch-title">Architecture at a glance</div>
+          <div class="arch-grid">
+            <div class="arch-card"><b>1. Market Data</b><span>Pulls prices, candles, order book, funding, and open interest from public exchange APIs.</span></div>
+            <div class="arch-card"><b>2. Signal Worker</b><span>Looks for mean-reversion opportunities and writes candidate signals.</span></div>
+            <div class="arch-card"><b>3. Risk + ML</b><span>Checks drawdown, drift, exposure, validation history, and model confidence before deployment.</span></div>
+            <div class="arch-card"><b>4. Order + P&L</b><span>Creates paper or Spot Testnet orders, tracks positions, exits, and realized performance.</span></div>
+          </div>
+          <div class="arch-store">
+            <div class="arch-card"><b>MariaDB</b><span>Permanent record: signals, requests, orders, positions, P&L, model registry, audit log.</span></div>
+            <div class="arch-card"><b>Redis</b><span>Fast latest state: prices, worker health, live P&L, locks, and pub/sub events.</span></div>
+          </div>
+          <div class="arch-note">Streamlit UI reads from Redis and MariaDB. The backend does not require the UI to run.</div>
+        </div>
+        """,
+        height=360,
+    )
+
+    st.subheader("Ubuntu install commands")
+    st.code(
+        """sudo apt-get update
+sudo apt-get install -y git
+
+git clone https://github.com/kaniampurath/superbot.git /home/myts/superbot
+cd /home/myts/superbot
+
+cp .env.production.example horizon-prod.env
+nano horizon-prod.env
+chmod 600 horizon-prod.env
+
+bash scripts/install_ubuntu.sh --check --app-dir /home/myts/superbot --app-user myts --env-file horizon-prod.env
+sudo bash scripts/install_ubuntu.sh --app-dir /home/myts/superbot --app-user myts --env-file horizon-prod.env
+
+sudo systemctl start horizon-backend
+sudo systemctl start horizon-ui
+bash scripts/healthcheck_ubuntu.sh""",
+        language="bash",
+    )
+
+    st.subheader("What must be configured")
+    st.dataframe(
+        pd.DataFrame(
+            [
+                {"Setting": "MYSQL_PASSWORD", "Purpose": "Database password for the app user", "Required": "Yes"},
+                {"Setting": "MYSQL_ROOT_PASSWORD", "Purpose": "MariaDB root password", "Required": "Yes"},
+                {"Setting": "ENABLE_REAL_TESTNET_ORDERS", "Purpose": "Set false until Testnet credentials are ready", "Required": "Yes"},
+                {"Setting": "testnet_key / testnet_secret", "Purpose": "Binance Spot Testnet credentials", "Required": "Only when Testnet orders are enabled"},
+            ]
+        ),
+        width="stretch",
+        hide_index=True,
+    )
+
+    st.info("For production, use Ubuntu 24.04 LTS, keep secrets outside GitHub, and run the backend headless with systemd.")
+
+
 def render_ui() -> None:
     import streamlit as st
 
@@ -1809,6 +1900,11 @@ def render_ui() -> None:
         """,
         unsafe_allow_html=True,
     )
+    page = st.radio("View", ["Home", "Trading Dashboard"], horizontal=True, label_visibility="collapsed")
+    if page == "Home":
+        render_home_page(st)
+        return
+
     st.title("Horizon Institutional Crypto Mispricing Lab")
     st.caption(f"Feasibility, validation, risk gating, and paper deployment. Stage={CFG.system_stage}. Spot Testnet orders require credentials and remain manually gated.")
 
