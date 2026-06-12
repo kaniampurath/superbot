@@ -1,0 +1,13 @@
+__pycache__/
+.pycache_check/
+*.pyc
+*.pyo
+.git/
+.env
+.env.*
+!.env.example
+!.env.production.example
+streamlit_*.log
+*.md
+horizonctl.ps1
+horizonctl.bat

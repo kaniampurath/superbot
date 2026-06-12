@@ -1,0 +1,16 @@
+[Unit]
+Description=Horizon Institutional Lab optional Streamlit UI
+Requires=docker.service horizon-backend.service
+After=docker.service horizon-backend.service network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+WorkingDirectory=/opt/horizon-lab
+ExecStart=/usr/bin/docker compose -f docker-compose.prod.yml --env-file .env --profile ui up -d --build horizon-ui
+ExecStop=/usr/bin/docker compose -f docker-compose.prod.yml --env-file .env --profile ui stop horizon-ui
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

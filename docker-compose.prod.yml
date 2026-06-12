@@ -1,0 +1,120 @@
+services:
+  mariadb:
+    image: mariadb:11
+    restart: unless-stopped
+    environment:
+      MYSQL_DATABASE: ${MYSQL_DATABASE:-horizon_lab}
+      MYSQL_USER: ${MYSQL_USER:-horizon_user}
+      MYSQL_PASSWORD: ${MYSQL_PASSWORD:?MYSQL_PASSWORD is required}
+      MYSQL_ROOT_PASSWORD: ${MYSQL_ROOT_PASSWORD:?MYSQL_ROOT_PASSWORD is required}
+    volumes:
+      - mariadb_data:/var/lib/mysql
+      - ./sql/init:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      test: ["CMD", "healthcheck.sh", "--connect", "--innodb_initialized"]
+      interval: 10s
+      timeout: 5s
+      retries: 20
+
+  redis:
+    image: redis:7-alpine
+    restart: unless-stopped
+    command: ["redis-server", "--appendonly", "yes"]
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 20
+
+  worker-marketdata:
+    build: .
+    restart: unless-stopped
+    env_file: ${HORIZON_ENV_FILE:-.env}
+    environment:
+      RUN_MODE: marketdata
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker-signal:
+    build: .
+    restart: unless-stopped
+    env_file: ${HORIZON_ENV_FILE:-.env}
+    environment:
+      RUN_MODE: signal
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker-risk:
+    build: .
+    restart: unless-stopped
+    env_file: ${HORIZON_ENV_FILE:-.env}
+    environment:
+      RUN_MODE: risk
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker-ml:
+    build: .
+    restart: unless-stopped
+    env_file: ${HORIZON_ENV_FILE:-.env}
+    environment:
+      RUN_MODE: ml
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker-order:
+    build: .
+    restart: unless-stopped
+    env_file: ${HORIZON_ENV_FILE:-.env}
+    environment:
+      RUN_MODE: order
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  worker-pnl:
+    build: .
+    restart: unless-stopped
+    env_file: ${HORIZON_ENV_FILE:-.env}
+    environment:
+      RUN_MODE: pnl
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  horizon-ui:
+    build: .
+    profiles: ["ui"]
+    restart: unless-stopped
+    env_file: ${HORIZON_ENV_FILE:-.env}
+    environment:
+      RUN_MODE: ui
+    ports:
+      - "8501:8501"
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+volumes:
+  mariadb_data:
+  redis_data:

@@ -1,0 +1,10 @@
+streamlit
+pandas
+numpy
+requests
+plotly
+python-dotenv
+websocket-client
+redis
+sqlalchemy
+pymysql
