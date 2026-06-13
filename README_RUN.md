@@ -196,6 +196,8 @@ The ML model is only an entry-confidence filter. It does not override research-o
 
 Model promotion is governed. `worker-ml` combines fresh candle-derived labels with stored `feature_snapshots` + `trade_outcomes`, trains a candidate model, then promotes it only when it meets `ML_MIN_TRAINING_ROWS`, `ML_MIN_ACCURACY`, `ML_MIN_PRECISION`, `ML_MIN_RECALL`, and, when `ML_PROMOTE_ONLY_IF_BETTER=true`, beats the active model. Promoted models archive previous active versions; rejected candidates remain in `model_registry` with status `REJECTED`.
 
+Learning quality is also guarded. `ML_BALANCE_CLASSES=true` reweights positive/negative labels during training, `ML_CANDIDATE_QUALITY_WEIGHT` gives stronger candidate rows more influence, and `ML_DRIFT_GATE_ENABLED=true` blocks deployment when top model features drift beyond `ML_DRIFT_BLOCK_THRESHOLD`. The Model Learning dashboard shows the current inference, label conversion, rolling 7/14/30 day validation, feature importance, feature drift, expected-vs-actual reversion, and execution quality.
+
 ## Optional Testnet Mode
 `ENABLE_REAL_TESTNET_ORDERS=true` is the default. Provide Binance Spot Testnet credentials and use tiny order sizes only. In production stage, Testnet deployment should remain manually approved unless you explicitly keep auto approval enabled.
 In training mode, auto-approved Testnet orders require valid Spot Testnet credentials and are submitted only to `https://testnet.binance.vision`.

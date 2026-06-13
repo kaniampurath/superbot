@@ -128,6 +128,11 @@ class Config:
     ml_min_precision: float = env_float("ML_MIN_PRECISION", 0.40)
     ml_min_recall: float = env_float("ML_MIN_RECALL", 0.03)
     ml_promote_only_if_better: bool = env_bool("ML_PROMOTE_ONLY_IF_BETTER", True)
+    ml_candidate_quality_weight: float = env_float("ML_CANDIDATE_QUALITY_WEIGHT", 1.5)
+    ml_balance_classes: bool = env_bool("ML_BALANCE_CLASSES", True)
+    ml_drift_gate_enabled: bool = env_bool("ML_DRIFT_GATE_ENABLED", True)
+    ml_drift_block_threshold: float = env_float("ML_DRIFT_BLOCK_THRESHOLD", 2.0)
+    ml_drift_warning_threshold: float = env_float("ML_DRIFT_WARNING_THRESHOLD", 1.0)
     min_validation_profit_factor: float = env_float("MIN_VALIDATION_PROFIT_FACTOR", 1.2)
     min_validation_expectancy_bps: float = env_float("MIN_VALIDATION_EXPECTANCY_BPS", 5)
     max_validation_drawdown_pct: float = env_float("MAX_VALIDATION_DRAWDOWN_PCT", 8)
@@ -874,6 +879,24 @@ def dedupe_training_frame(training: pd.DataFrame) -> pd.DataFrame:
     return frame.sort_values("time").reset_index(drop=True) if "time" in frame.columns else frame.reset_index(drop=True)
 
 
+def training_sample_weights(training: pd.DataFrame) -> np.ndarray:
+    weights = np.ones(len(training), dtype=float)
+    if training.empty:
+        return weights
+    labels = training["label"].astype(int)
+    if CFG.ml_balance_classes:
+        for label in [0, 1]:
+            count = int((labels == label).sum())
+            if count:
+                weights[labels == label] *= len(labels) / (2.0 * count)
+    candidate_mask = training.get("side", pd.Series([""] * len(training))).astype(str).isin(["BUY", "SELL"]).to_numpy()
+    stretch = training.get("z_abs", pd.Series([0.0] * len(training))).astype(float).to_numpy()
+    opportunity = training.get("expected_reversion_bps", pd.Series([0.0] * len(training))).astype(float).to_numpy()
+    quality_mask = candidate_mask & (stretch >= max(1.0, CFG.mean_reversion_z * 0.6)) & (opportunity >= (2 * CFG.fee_bps + CFG.slippage_bps))
+    weights[quality_mask] *= max(CFG.ml_candidate_quality_weight, 1.0)
+    return weights / max(float(weights.mean()), 1e-9)
+
+
 def signal_features(signal: dict[str, Any]) -> dict[str, float]:
     z_score = float(signal.get("z_score", 0.0))
     rsi = float(signal.get("rsi", 50.0))
@@ -983,9 +1006,11 @@ def train_logistic_model(training: pd.DataFrame) -> dict[str, Any] | None:
         return None
     x = training[ML_FEATURES].astype(float).replace([np.inf, -np.inf], np.nan).fillna(0.0).to_numpy()
     y = training["label"].astype(float).to_numpy()
+    weights_all = training_sample_weights(training)
     split = max(20, int(len(x) * 0.7))
     train_x, test_x = x[:split], x[split:]
     train_y, test_y = y[:split], y[split:]
+    train_weights = weights_all[:split]
     mean = train_x.mean(axis=0)
     std = train_x.std(axis=0)
     std[std == 0] = 1.0
@@ -997,9 +1022,9 @@ def train_logistic_model(training: pd.DataFrame) -> dict[str, Any] | None:
     l2 = 0.01
     for _ in range(700):
         pred = sigmoid(train_x @ weights + bias)
-        error = pred - train_y
-        weights -= lr * ((train_x.T @ error) / len(train_x) + l2 * weights)
-        bias -= lr * float(error.mean())
+        error = (pred - train_y) * train_weights
+        weights -= lr * ((train_x.T @ error) / max(float(train_weights.sum()), 1e-9) + l2 * weights)
+        bias -= lr * float(error.sum() / max(float(train_weights.sum()), 1e-9))
     test_pred = sigmoid(test_x @ weights + bias)
     test_label = test_y if len(test_y) else train_y
     binary = test_pred >= 0.5
@@ -1020,7 +1045,15 @@ def train_logistic_model(training: pd.DataFrame) -> dict[str, Any] | None:
         "std": std.tolist(),
         "weights": weights.tolist(),
         "bias": bias,
-        "metrics": {"accuracy": accuracy, "precision": precision, "recall": recall, "rows": int(len(training)), "positive_rate": float(y.mean())},
+        "metrics": {
+            "accuracy": accuracy,
+            "precision": precision,
+            "recall": recall,
+            "rows": int(len(training)),
+            "positive_rate": float(y.mean()),
+            "class_balanced": CFG.ml_balance_classes,
+            "candidate_quality_weight": CFG.ml_candidate_quality_weight,
+        },
     }
 
 
@@ -1337,6 +1370,7 @@ def run_signal() -> None:
     init_schema(engine)
     while True:
         model = load_ml_model(engine, state) if CFG.ml_enabled else None
+        drift_training = load_labeled_training_from_db(engine) if CFG.ml_drift_gate_enabled and model else pd.DataFrame()
         bucket = int(time.time() // 60)
         for symbol in CFG.symbols:
             price_payload = state.get_json(f"latest_price:{symbol}") or {"price": simulated_price(symbol), "data_quality": "SIMULATED"}
@@ -1357,6 +1391,10 @@ def run_signal() -> None:
             ml_confidence, ml_version = predict_with_model(model, features) if CFG.ml_enabled else (1.0, "disabled")
             signal["ml_confidence"] = ml_confidence
             signal["ml_model_version"] = ml_version
+            drift_blockers = feature_drift_blockers(drift_training, model, features)
+            if drift_blockers:
+                signal["deployable"] = False
+                signal.setdefault("deployment_blockers", []).extend(drift_blockers)
             if CFG.ml_confidence_gate_enabled and ml_confidence < CFG.min_ml_confidence:
                 signal["deployable"] = False
                 signal.setdefault("deployment_blockers", []).append("ml_confidence_below_threshold")
@@ -1395,6 +1433,7 @@ def run_signal() -> None:
                 and CFG.auto_approve_order_mode in {"PAPER", "TESTNET"}
                 and candidate_side in {"BUY", "SELL"}
                 and (not CFG.deploy_symbol_whitelist or symbol in CFG.deploy_symbol_whitelist)
+                and not any(str(item).startswith("ml_feature_drift:") for item in signal.get("deployment_blockers", []))
                 and ml_confidence >= CFG.training_auto_approve_min_ml_confidence
                 and float(signal.get("spread_bps", 999.0)) <= 10
                 and float(signal.get("model_slippage_bps", 999.0)) <= CFG.slippage_bps
@@ -2265,6 +2304,25 @@ def training_growth_chart(engine: Engine | None) -> go.Figure:
     return dark_figure(fig, height=220)
 
 
+def label_conversion_chart(engine: Engine | None) -> go.Figure:
+    feature_rows = db_rows(engine, "SELECT DATE(ts) day, COUNT(*) feature_rows FROM feature_snapshots GROUP BY DATE(ts) ORDER BY day DESC LIMIT 14")
+    outcome_rows = db_rows(engine, "SELECT DATE(ts) day, COUNT(*) labels FROM trade_outcomes GROUP BY DATE(ts) ORDER BY day DESC LIMIT 14")
+    features = pd.DataFrame(feature_rows) if feature_rows else pd.DataFrame(columns=["day", "feature_rows"])
+    labels = pd.DataFrame(outcome_rows) if outcome_rows else pd.DataFrame(columns=["day", "labels"])
+    if features.empty and labels.empty:
+        days = pd.date_range(end=now_utc().date(), periods=7)
+        merged = pd.DataFrame({"day": days, "feature_rows": [0] * len(days), "labels": [0] * len(days)})
+    else:
+        merged = pd.merge(features, labels, on="day", how="outer").fillna(0).sort_values("day")
+    merged["conversion"] = merged["labels"].astype(float) / merged["feature_rows"].astype(float).replace(0, np.nan)
+    merged["conversion"] = merged["conversion"].fillna(0) * 100
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=merged["day"], y=merged["conversion"], name="Label conversion", marker_color="#22c55e"))
+    fig.add_hline(y=10, line_dash="dot", line_color="#facc15")
+    fig.update_yaxes(range=[0, max(25, float(merged["conversion"].max() if not merged.empty else 0) * 1.2)], ticksuffix="%")
+    return dark_figure(fig, height=220)
+
+
 def training_coverage_rows(engine: Engine | None) -> pd.DataFrame:
     rows = db_rows(
         engine,
@@ -2281,6 +2339,30 @@ def training_coverage_rows(engine: Engine | None) -> pd.DataFrame:
     frame["positive_rate"] = frame["positive_rate"].astype(float).map(lambda value: f"{value:.1%}")
     frame["avg_forward_return"] = frame["avg_forward_return"].astype(float).map(lambda value: f"{value * 10000:.1f} bps")
     return frame
+
+
+def rolling_validation_rows(engine: Engine | None) -> pd.DataFrame:
+    predictions = prediction_learning_frame(engine, 5000)
+    if predictions.empty:
+        return pd.DataFrame(columns=["Window", "Evaluated", "Accuracy", "Precision", "Recall", "Avg Return"])
+    predictions["created_at"] = pd.to_datetime(predictions["created_at"], utc=True).dt.tz_convert(None)
+    predictions = predictions.dropna(subset=["actual_outcome"])
+    rows = []
+    now = utc_naive_timestamp(pd.Timestamp.now(tz=UTC))
+    for days in [7, 14, 30]:
+        window = predictions[predictions["created_at"] >= now - pd.Timedelta(days=days)].copy()
+        if window.empty:
+            rows.append({"Window": f"{days}D", "Evaluated": 0, "Accuracy": "0.0%", "Precision": "0.0%", "Recall": "0.0%", "Avg Return": "0.0 bps"})
+            continue
+        predicted = (window["confidence"].astype(float) >= window["threshold"].astype(float)).astype(int)
+        actual = window["actual_outcome"].astype(int)
+        positives = actual == 1
+        precision = float(((predicted == 1) & positives).sum() / max((predicted == 1).sum(), 1))
+        recall = float(((predicted == 1) & positives).sum() / max(positives.sum(), 1))
+        accuracy = float((predicted == actual).mean())
+        avg_return = float(window["actual_return"].dropna().mean() or 0.0) * 10000
+        rows.append({"Window": f"{days}D", "Evaluated": len(window), "Accuracy": f"{accuracy:.1%}", "Precision": f"{precision:.1%}", "Recall": f"{recall:.1%}", "Avg Return": f"{avg_return:.1f} bps"})
+    return pd.DataFrame(rows)
 
 
 def safe_json_dict(value: Any) -> dict[str, Any]:
@@ -2331,12 +2413,102 @@ def prediction_learning_frame(engine: Engine | None, limit: int = 1000) -> pd.Da
     return pd.DataFrame(parsed)
 
 
-def feature_importance_chart(model: dict[str, Any], latest_candidate: dict[str, Any]) -> go.Figure:
+def model_importance_map(model: dict[str, Any], latest_candidate: dict[str, Any] | None = None) -> dict[str, float]:
+    latest_candidate = latest_candidate or {}
     importance = latest_candidate.get("feature_importance") or model.get("feature_importance") or {}
-    if not importance and model.get("weights"):
+    if importance:
+        return {name: float(importance.get(name, 0.0) or 0.0) for name in ML_FEATURES}
+    if model.get("weights"):
         weights = [abs(float(value)) for value in model.get("weights", [])]
         total = sum(weights) or 1.0
-        importance = {name: weight / total for name, weight in zip(model.get("features", ML_FEATURES), weights)}
+        return {name: weight / total for name, weight in zip(model.get("features", ML_FEATURES), weights)}
+    return {name: 1.0 / len(ML_FEATURES) for name in ML_FEATURES}
+
+
+def feature_drift_rows(engine: Engine | None, rows: list[dict[str, Any]], model: dict[str, Any] | None = None, latest_candidate: dict[str, Any] | None = None) -> pd.DataFrame:
+    history = load_labeled_training_from_db(engine)
+    live = pd.DataFrame([{name: float(signal_features(row).get(name, 0.0)) for name in ML_FEATURES} for row in rows])
+    importance = model_importance_map(model or {}, latest_candidate)
+    drift_rows = []
+    for feature in ML_FEATURES:
+        if history.empty or live.empty or feature not in history.columns:
+            drift_value = 0.0
+        else:
+            hist_series = history[feature].astype(float)
+            hist_std = float(hist_series.std() or 1.0)
+            drift_value = abs(float(live[feature].mean()) - float(hist_series.mean())) / max(hist_std, 1e-9)
+        drift_rows.append(
+            {
+                "feature": feature,
+                "drift": min(float(drift_value), 5.0),
+                "importance": float(importance.get(feature, 0.0)),
+                "weighted_drift": min(float(drift_value), 5.0) * float(importance.get(feature, 0.0)),
+                "status": "RED" if drift_value >= CFG.ml_drift_block_threshold else "AMBER" if drift_value >= CFG.ml_drift_warning_threshold else "GREEN",
+            }
+        )
+    return pd.DataFrame(drift_rows).sort_values(["weighted_drift", "drift"], ascending=False)
+
+
+def feature_drift_blockers(training: pd.DataFrame, model: dict[str, Any] | None, features: dict[str, float]) -> list[str]:
+    if not CFG.ml_drift_gate_enabled or training.empty or not model:
+        return []
+    importance = model_importance_map(model)
+    top_features = sorted(ML_FEATURES, key=lambda name: importance.get(name, 0.0), reverse=True)[:5]
+    blockers = []
+    for feature in top_features:
+        if feature not in training.columns:
+            continue
+        hist_series = training[feature].astype(float)
+        hist_std = float(hist_series.std() or 1.0)
+        drift = abs(float(features.get(feature, 0.0)) - float(hist_series.mean())) / max(hist_std, 1e-9)
+        if drift >= CFG.ml_drift_block_threshold:
+            blockers.append(f"ml_feature_drift:{feature}:{drift:.1f}")
+    return blockers
+
+
+def learning_health_summary(engine: Engine | None, rows: list[dict[str, Any]], model: dict[str, Any], latest_candidate: dict[str, Any]) -> dict[str, Any]:
+    feature_rows = db_rows(engine, "SELECT COUNT(*) rows_count FROM feature_snapshots WHERE ts >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 24 HOUR)")
+    label_rows = db_rows(engine, "SELECT COUNT(*) rows_count, AVG(label) positive_rate, AVG(forward_return) avg_return FROM trade_outcomes WHERE ts >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 24 HOUR)")
+    predictions = prediction_learning_frame(engine, 500)
+    evaluated = predictions.dropna(subset=["actual_outcome"]) if not predictions.empty else predictions
+    feature_count = int((feature_rows[0].get("rows_count") if feature_rows else 0) or 0)
+    label_count = int((label_rows[0].get("rows_count") if label_rows else 0) or 0)
+    conversion = label_count / max(feature_count, 1)
+    latest_metrics = latest_candidate.get("metrics", {}) if latest_candidate else {}
+    drift = feature_drift_rows(engine, rows, model, latest_candidate)
+    top_drift = float(drift.head(5)["drift"].max()) if not drift.empty else 0.0
+    evaluated_accuracy = float((evaluated["actual_outcome"].astype(int) == (evaluated["confidence"].astype(float) >= evaluated["threshold"].astype(float)).astype(int)).mean()) if not evaluated.empty else 0.0
+    status = "GREEN"
+    reasons: list[str] = []
+    if float(latest_metrics.get("accuracy", 0) or 0) < CFG.ml_min_accuracy:
+        status = "RED"
+        reasons.append("accuracy below promotion threshold")
+    if conversion < 0.10:
+        status = "RED"
+        reasons.append("too few predictions are becoming labels")
+    if top_drift >= CFG.ml_drift_block_threshold:
+        status = "RED"
+        reasons.append("important live features drifted from training")
+    elif top_drift >= CFG.ml_drift_warning_threshold and status != "RED":
+        status = "AMBER"
+        reasons.append("feature drift is elevated")
+    if not reasons:
+        reasons.append("learning loop is healthy enough for continued testnet evaluation")
+    return {
+        "status": status,
+        "feature_rows_24h": feature_count,
+        "labels_24h": label_count,
+        "label_conversion": conversion,
+        "evaluated_accuracy": evaluated_accuracy,
+        "top_feature_drift": top_drift,
+        "positive_rate_24h": float((label_rows[0].get("positive_rate") if label_rows else 0) or 0),
+        "avg_return_24h": float((label_rows[0].get("avg_return") if label_rows else 0) or 0),
+        "inference": "; ".join(reasons),
+    }
+
+
+def feature_importance_chart(model: dict[str, Any], latest_candidate: dict[str, Any]) -> go.Figure:
+    importance = model_importance_map(model, latest_candidate)
     frame = pd.DataFrame({"feature": ML_FEATURES, "importance": [float(importance.get(name, 0.0)) * 100 for name in ML_FEATURES]})
     frame = frame.sort_values("importance", ascending=True).tail(10)
     fig = go.Figure(go.Bar(x=frame["importance"], y=frame["feature"], orientation="h", marker_color="#38bdf8"))
@@ -2345,17 +2517,7 @@ def feature_importance_chart(model: dict[str, Any], latest_candidate: dict[str, 
 
 
 def feature_drift_chart(engine: Engine | None, rows: list[dict[str, Any]]) -> go.Figure:
-    history = load_labeled_training_from_db(engine)
-    live = pd.DataFrame([{name: float(signal_features(row).get(name, 0.0)) for name in ML_FEATURES} for row in rows])
-    if history.empty or live.empty:
-        drift = pd.DataFrame({"feature": ML_FEATURES[:8], "drift": [0.0] * min(8, len(ML_FEATURES))})
-    else:
-        drift_rows = []
-        for feature in ML_FEATURES:
-            hist_std = float(history[feature].astype(float).std() or 1.0)
-            value = abs(float(live[feature].mean()) - float(history[feature].astype(float).mean())) / max(hist_std, 1e-9)
-            drift_rows.append({"feature": feature, "drift": min(value, 5.0)})
-        drift = pd.DataFrame(drift_rows).sort_values("drift", ascending=True).tail(10)
+    drift = feature_drift_rows(engine, rows).sort_values("drift", ascending=True).tail(10)
     colors = ["#ef4444" if value >= 2 else "#facc15" if value >= 1 else "#22c55e" for value in drift["drift"]]
     fig = go.Figure(go.Bar(x=drift["drift"], y=drift["feature"], orientation="h", marker_color=colors))
     fig.add_vline(x=1, line_dash="dot", line_color="#facc15")
@@ -2910,15 +3072,28 @@ def render_ui() -> None:
 
     elif page == "Model Learning":
         st.subheader("Model Learning")
-        st.markdown("This page shows whether the model is collecting data, retraining, and improving enough to trust its entry confidence.")
+        st.markdown("This page shows whether the model is collecting labels, improving, and safe enough to influence entries.")
         latest_rows = int(latest_candidate.get("trained_rows", 0) or 0) if latest_candidate else 0
         latest_accuracy = float(latest_candidate_metrics.get("accuracy", 0) or 0)
         latest_reason = str(latest_candidate_metrics.get("promotion_reason", "")) or "waiting_for_training"
-        c1, c2, c3, c4 = st.columns(4)
-        c1.markdown(ui_card("Active Version", model.get("version", "None"), "Model registry", "GREEN" if model else "AMBER"), unsafe_allow_html=True)
-        c2.markdown(ui_card("Latest Training Rows", str(latest_rows), f"Active rows {model.get('trained_rows', 0) if model else 0}", "GREEN" if latest_rows >= CFG.ml_min_training_rows else "AMBER"), unsafe_allow_html=True)
-        c3.markdown(ui_card("Latest Accuracy", f"{latest_accuracy:.2%}", f"Reason: {latest_reason}", "GREEN" if latest_accuracy >= CFG.ml_min_accuracy else "AMBER"), unsafe_allow_html=True)
-        c4.markdown(ui_card("Confidence Gate", f"{model_conf:.2f}", f"Target {CFG.min_ml_confidence:.2f}", "GREEN" if model_conf >= CFG.min_ml_confidence else "AMBER"), unsafe_allow_html=True)
+        learning = learning_health_summary(engine, rows, model, latest_candidate)
+        drift_rows = feature_drift_rows(engine, rows, model, latest_candidate)
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.markdown(ui_card("Learning State", plain_status(learning["status"]), learning["inference"], learning["status"]), unsafe_allow_html=True)
+        c2.markdown(ui_card("Label Conversion", f"{learning['label_conversion']:.1%}", f"{learning['labels_24h']} labels / {learning['feature_rows_24h']} features", "GREEN" if learning["label_conversion"] >= 0.10 else "RED"), unsafe_allow_html=True)
+        c3.markdown(ui_card("Latest Accuracy", f"{latest_accuracy:.1%}", f"Target {CFG.ml_min_accuracy:.0%}", "GREEN" if latest_accuracy >= CFG.ml_min_accuracy else "RED"), unsafe_allow_html=True)
+        c4.markdown(ui_card("Top Drift", f"{learning['top_feature_drift']:.1f}", f"Block at {CFG.ml_drift_block_threshold:.1f}", "GREEN" if learning["top_feature_drift"] < CFG.ml_drift_warning_threshold else "RED" if learning["top_feature_drift"] >= CFG.ml_drift_block_threshold else "AMBER"), unsafe_allow_html=True)
+        c5.markdown(ui_card("Confidence Gate", f"{model_conf:.2f}", f"Target {CFG.min_ml_confidence:.2f}", "GREEN" if model_conf >= CFG.min_ml_confidence else "AMBER"), unsafe_allow_html=True)
+        st.markdown(
+            ui_panel(
+                "Current Inference",
+                f"<div class='sb-health-row'><span class='sb-dot' style='background:{ui_status_color(learning['status'])}'></span>"
+                f"<div><div class='sb-health-title'>{html_lib.escape(learning['inference'].capitalize())}</div>"
+                f"<div class='sb-health-sub'>Latest model decision: {html_lib.escape(latest_reason)} | positive rate 24h {learning['positive_rate_24h']:.1%} | avg outcome {learning['avg_return_24h'] * 10000:.1f} bps</div></div>"
+                f"<b>{'Use only in training/testnet' if learning['status'] != 'GREEN' else 'Eligible for cautious testnet sizing'}</b></div>",
+            ),
+            unsafe_allow_html=True,
+        )
         if latest_candidate:
             st.markdown(
                 ui_panel(
@@ -2930,43 +3105,48 @@ def render_ui() -> None:
                 ),
                 unsafe_allow_html=True,
             )
-        l1, l2 = st.columns(2)
+        l1, l2, l3 = st.columns([1.05, 1, 1])
         with l1:
             st.plotly_chart(model_learning_chart(engine, rows), width="stretch")
         with l2:
             st.plotly_chart(training_growth_chart(engine), width="stretch")
-        q1, q2 = st.columns(2)
+        with l3:
+            st.plotly_chart(label_conversion_chart(engine), width="stretch")
+        q1, q2 = st.columns([1, 1])
         with q1:
             st.markdown("<div class='sb-panel-title'>Feature Importance</div>", unsafe_allow_html=True)
             st.plotly_chart(feature_importance_chart(model, latest_candidate), width="stretch")
         with q2:
             st.markdown("<div class='sb-panel-title'>Feature Drift</div>", unsafe_allow_html=True)
             st.plotly_chart(feature_drift_chart(engine, rows), width="stretch")
-        q3, q4 = st.columns(2)
+        q3, q4, q5 = st.columns([1, 1, 1])
         with q3:
             st.markdown("<div class='sb-panel-title'>Prediction Confidence Trend</div>", unsafe_allow_html=True)
             st.plotly_chart(prediction_confidence_trend_chart(engine, rows), width="stretch")
         with q4:
             st.markdown("<div class='sb-panel-title'>Hit Rate by Feature Bucket</div>", unsafe_allow_html=True)
             st.plotly_chart(hit_rate_by_feature_bucket_chart(engine), width="stretch")
-        q5, q6 = st.columns(2)
         with q5:
+            render_detail_table(st, "Rolling Validation", rolling_validation_rows(engine))
+        q6, q7 = st.columns([1, 1])
+        with q6:
             st.markdown("<div class='sb-panel-title'>Expected vs Actual Reversion</div>", unsafe_allow_html=True)
             st.plotly_chart(expected_vs_actual_reversion_chart(engine), width="stretch")
-        with q6:
+        with q7:
             st.markdown("<div class='sb-panel-title'>Slippage vs Spread</div>", unsafe_allow_html=True)
             st.plotly_chart(slippage_vs_spread_chart(engine), width="stretch")
-        q7, q8 = st.columns(2)
-        with q7:
+        q8, q9 = st.columns([1, 1])
+        with q8:
             st.markdown("<div class='sb-panel-title'>Funding / Open Interest Pressure</div>", unsafe_allow_html=True)
             st.plotly_chart(funding_oi_pressure_chart(engine, rows), width="stretch")
-        with q8:
+        with q9:
             st.markdown("<div class='sb-panel-title'>Model Score Waterfall</div>", unsafe_allow_html=True)
             st.plotly_chart(model_score_waterfall_chart(model, best), width="stretch")
         cov_left, cov_right = st.columns([1.05, 1])
         with cov_left:
             render_detail_table(st, "Daily Labeled Outcome Coverage", training_coverage_rows(engine))
         with cov_right:
+            render_detail_table(st, "Top Drift Drivers", drift_rows.head(8)[["feature", "drift", "importance", "status"]])
             render_detail_table(st, "Features Used By Entry Confidence Model", model_feature_rows())
         render_detail_table(st, "Model Registry History", model_history_rows(engine))
 
