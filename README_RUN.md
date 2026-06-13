@@ -118,6 +118,8 @@ PowerShell:
 .\horizonctl.ps1 health
 .\horizonctl.ps1 start-backend
 .\horizonctl.ps1 start-ui
+.\horizonctl.ps1 performance
+.\horizonctl.ps1 performance-json
 .\horizonctl.ps1 status
 .\horizonctl.ps1 stop
 ```
@@ -128,6 +130,8 @@ Command Prompt:
 horizonctl.bat health
 horizonctl.bat start-backend
 horizonctl.bat start-ui
+horizonctl.bat performance
+horizonctl.bat performance-json
 horizonctl.bat status
 horizonctl.bat stop
 ```
@@ -140,8 +144,19 @@ Actions:
 | `start-backend` | Starts the headless backend only: MariaDB, Redis, market data, signal, risk, ML, order, and P&L workers |
 | `start-ui` | Starts backend plus optional Streamlit UI using the `ui` profile |
 | `local-ui` | Runs only the local Streamlit UI process from the prompt |
+| `performance` | Prints equity, P&L, drawdown, risk, drift, worker status, orders, model metrics, and latest signals from backend state |
+| `performance-json` | Prints the same report as JSON for scripts and monitoring |
 | `status` | Shows Docker service state and UI health |
 | `stop` | Stops backend and UI containers |
+
+Ubuntu:
+
+```bash
+bash scripts/horizonctl.sh health
+bash scripts/horizonctl.sh status
+bash scripts/horizonctl.sh performance
+bash scripts/horizonctl.sh performance-json
+```
 
 ## Local Run
 ```powershell

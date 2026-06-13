@@ -211,7 +211,7 @@ class RedisState:
 
 
 def db_engine(cfg: Config) -> Engine | None:
-    url = f"mysql+pymysql://{cfg.mysql_user}:{cfg.mysql_password}@{cfg.mysql_host}:{cfg.mysql_port}/{cfg.mysql_database}?charset=utf8mb4"
+    url = f"mysql+pymysql://{cfg.mysql_user}:{cfg.mysql_password}@{cfg.mysql_host}:{cfg.mysql_port}/{cfg.mysql_database}?charset=utf8mb4&connect_timeout=3"
     try:
         engine = create_engine(url, pool_pre_ping=True, pool_recycle=1800)
         with engine.connect() as conn:
@@ -1732,6 +1732,129 @@ def deployment_queue_rows(engine: Engine | None) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def db_scalar(engine: Engine | None, statement: str, params: dict[str, Any] | None = None, default: Any = None) -> Any:
+    if engine is None:
+        return default
+    try:
+        with engine.connect() as conn:
+            value = conn.execute(text(statement), params or {}).scalar()
+            return default if value is None else value
+    except Exception:
+        return default
+
+
+def db_rows(engine: Engine | None, statement: str, params: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+    if engine is None:
+        return []
+    try:
+        with engine.connect() as conn:
+            return [dict(row._mapping) for row in conn.execute(text(statement), params or {}).fetchall()]
+    except Exception:
+        return []
+
+
+def performance_report(state: RedisState, engine: Engine | None) -> dict[str, Any]:
+    pnl = state.get_json("live_pnl") or {}
+    risk = state.get_json("risk_state") or {}
+    drift = state.get_json("drift_state") or {}
+    workers = []
+    for worker in ["worker-marketdata", "worker-signal", "worker-risk", "worker-ml", "worker-order", "worker-pnl"]:
+        payload = state.get_json(f"worker_status:{worker}") or {}
+        workers.append({"worker": worker, "status": payload.get("status", "OFFLINE"), "last_seen": payload.get("last_seen", ""), "detail": payload.get("detail", {})})
+    if engine is not None and all(row["status"] == "OFFLINE" for row in workers):
+        workers = db_rows(engine, "SELECT worker_name AS worker, status, last_seen, detail_json AS detail FROM worker_heartbeat ORDER BY worker_name")
+
+    latest_signals = db_rows(
+        engine,
+        """SELECT symbol, side, price, composite_score, ml_confidence, deployable, validation_status, risk_status, ts
+           FROM signals ORDER BY id DESC LIMIT 10""",
+    )
+    recent_orders = db_rows(
+        engine,
+        """SELECT created_at, symbol, side, mode, status, requested_size_usdt, block_reason
+           FROM deployment_requests ORDER BY id DESC LIMIT 10""",
+    )
+    active_model = db_rows(
+        engine,
+        """SELECT version, status, trained_rows, metrics_json, trained_at
+           FROM model_registry WHERE status='ACTIVE' ORDER BY trained_at DESC LIMIT 1""",
+    )
+    recent_backtest = db_rows(
+        engine,
+        """SELECT symbol, total_trades, win_rate, profit_factor, expectancy, max_drawdown, sharpe_like, ts
+           FROM backtest_runs ORDER BY id DESC LIMIT 5""",
+    )
+    positions = db_rows(
+        engine,
+        """SELECT symbol, side, entry_price, current_price, size_usdt, unrealized_pnl, realized_pnl, status, updated_at
+           FROM positions ORDER BY id DESC LIMIT 10""",
+    )
+
+    order_counts = {
+        "pending": int(db_scalar(engine, "SELECT COUNT(*) FROM deployment_requests WHERE status='PENDING'", default=0) or 0),
+        "executed": int(db_scalar(engine, "SELECT COUNT(*) FROM deployment_requests WHERE status='EXECUTED'", default=0) or 0),
+        "blocked": int(db_scalar(engine, "SELECT COUNT(*) FROM deployment_requests WHERE status='BLOCKED'", default=0) or 0),
+    }
+    open_positions = int(db_scalar(engine, "SELECT COUNT(*) FROM positions WHERE status='OPEN'", default=0) or 0)
+    active_model_payload = active_model[0] if active_model else {}
+    if active_model_payload.get("metrics_json"):
+        try:
+            active_model_payload["metrics"] = json.loads(active_model_payload.pop("metrics_json") or "{}")
+        except Exception:
+            active_model_payload["metrics"] = {}
+
+    return {
+        "generated_at": iso_now(),
+        "runtime": {"stage": CFG.system_stage, "headless_capable": True, "ui_required": False, "symbols": list(CFG.symbols), "strategy_interval": CFG.strategy_interval},
+        "connections": {"redis": state.ok, "mariadb": engine is not None},
+        "pnl": {
+            "realized": float(pnl.get("realized_pnl", 0.0) or 0.0),
+            "unrealized": float(pnl.get("unrealized_pnl", 0.0) or 0.0),
+            "daily": float(pnl.get("daily_pnl", 0.0) or 0.0),
+            "equity": float(pnl.get("equity", CFG.starting_equity) or CFG.starting_equity),
+            "drawdown_pct": float(pnl.get("current_dd_pct", 0.0) or 0.0),
+            "ts": pnl.get("ts", ""),
+        },
+        "risk": risk,
+        "drift": drift,
+        "workers": workers,
+        "orders": order_counts,
+        "open_positions": open_positions,
+        "active_model": active_model_payload,
+        "latest_signals": latest_signals,
+        "recent_orders": recent_orders,
+        "recent_backtests": recent_backtest,
+        "positions": positions,
+    }
+
+
+def print_performance_report(report: dict[str, Any], as_json: bool = False) -> None:
+    if as_json:
+        print(json.dumps(report, indent=2, default=str))
+        return
+    pnl = report["pnl"]
+    print("Horizon performance report")
+    print(f"Generated: {report['generated_at']}")
+    print(f"Stage: {report['runtime']['stage']} | Headless: yes | UI required: no")
+    print(f"Connections: redis={report['connections']['redis']} mariadb={report['connections']['mariadb']}")
+    print("")
+    print(f"Equity: ${pnl['equity']:,.2f} | Daily P&L: ${pnl['daily']:,.2f} | Realized: ${pnl['realized']:,.2f} | Unrealized: ${pnl['unrealized']:,.2f} | DD: {pnl['drawdown_pct']:.2f}%")
+    print(f"Risk: {report.get('risk', {}).get('status', 'UNKNOWN')} | Drift: {report.get('drift', {}).get('status', 'UNKNOWN')} score={float(report.get('drift', {}).get('drift_score', 0) or 0):.1f}")
+    print(f"Orders: pending={report['orders']['pending']} executed={report['orders']['executed']} blocked={report['orders']['blocked']} | Open positions={report['open_positions']}")
+    model = report.get("active_model") or {}
+    if model:
+        metrics = model.get("metrics", {})
+        print(f"Active ML: {model.get('version', '')} rows={model.get('trained_rows', 0)} accuracy={float(metrics.get('accuracy', 0) or 0):.3f} precision={float(metrics.get('precision', 0) or 0):.3f} recall={float(metrics.get('recall', 0) or 0):.3f}")
+    print("")
+    print("Workers")
+    for row in report["workers"]:
+        print(f"  {row.get('worker'):<18} {row.get('status', 'UNKNOWN'):<10} {row.get('last_seen', '')}")
+    print("")
+    print("Latest signals")
+    for row in report["latest_signals"][:6]:
+        print(f"  {row.get('symbol',''):<8} {row.get('side',''):<5} score={float(row.get('composite_score', 0) or 0):>6.2f} ml={float(row.get('ml_confidence', 0) or 0):.2f} deployable={row.get('deployable')} ts={row.get('ts','')}")
+
+
 def production_progress_chart(state: RedisState, rows: list[dict[str, Any]], validation: dict[str, Any], risk: dict[str, Any], drift: dict[str, Any]) -> go.Figure:
     backtest = validation["backtest"]
     profit_factor = float(backtest.get("profit_factor", 0.0))
@@ -1850,7 +1973,8 @@ sudo bash scripts/install_ubuntu.sh --app-dir /home/myts/superbot --app-user myt
 
 sudo systemctl start horizon-backend
 sudo systemctl start horizon-ui
-bash scripts/healthcheck_ubuntu.sh""",
+bash scripts/healthcheck_ubuntu.sh
+bash scripts/horizonctl.sh performance""",
         language="bash",
     )
 
@@ -2025,22 +2149,27 @@ def render_ui() -> None:
 
 
 def main() -> None:
-    if CFG.run_mode == "ui":
+    cli_modes = {"ui", "marketdata", "signal", "risk", "order", "ml", "pnl", "report"}
+    mode = sys.argv[1].strip().lower() if len(sys.argv) > 1 and sys.argv[1].strip().lower() in cli_modes else CFG.run_mode
+    if mode == "ui":
         if "streamlit" not in sys.modules:
             os.execvp("streamlit", ["streamlit", "run", __file__, "--server.address=0.0.0.0", "--server.port=8501"])
         render_ui()
-    elif CFG.run_mode == "marketdata":
+    elif mode == "marketdata":
         run_marketdata()
-    elif CFG.run_mode == "signal":
+    elif mode == "signal":
         run_signal()
-    elif CFG.run_mode == "risk":
+    elif mode == "risk":
         run_risk()
-    elif CFG.run_mode == "order":
+    elif mode == "order":
         run_order()
-    elif CFG.run_mode == "ml":
+    elif mode == "ml":
         run_ml()
-    elif CFG.run_mode == "pnl":
+    elif mode == "pnl":
         run_pnl()
+    elif mode == "report":
+        state, engine = RedisState(CFG), db_engine(CFG)
+        print_performance_report(performance_report(state, engine), as_json="--json" in sys.argv)
     else:
         raise SystemExit(f"Unknown RUN_MODE={CFG.run_mode}")
 

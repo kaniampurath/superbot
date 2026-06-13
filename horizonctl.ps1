@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("start-backend", "start-ui", "local-ui", "health", "status", "stop")]
+    [ValidateSet("start-backend", "start-ui", "local-ui", "health", "status", "performance", "performance-json", "stop")]
     [string]$Action = "health"
 )
 
@@ -119,6 +119,20 @@ switch ($Action) {
             Write-Host "UI health: $($response.Content.Trim())"
         } catch {
             Write-Host "UI health: unavailable"
+        }
+    }
+    "performance" {
+        if (Invoke-NativeOk { docker info }) {
+            docker compose run --rm --no-deps worker-signal python scripts/performance_report.py --env-file .env.example
+        } else {
+            python scripts/performance_report.py --env-file .env.example
+        }
+    }
+    "performance-json" {
+        if (Invoke-NativeOk { docker info }) {
+            docker compose run --rm --no-deps worker-signal python scripts/performance_report.py --env-file .env.example --json
+        } else {
+            python scripts/performance_report.py --env-file .env.example --json
         }
     }
     "stop" {

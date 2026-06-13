@@ -27,6 +27,7 @@ sudo bash scripts/install_ubuntu.sh --app-dir /home/myts/superbot --app-user myt
 sudo systemctl start horizon-backend
 sudo systemctl start horizon-ui
 bash scripts/healthcheck_ubuntu.sh
+bash scripts/horizonctl.sh performance
 ```
 
 ## Required Config
@@ -46,5 +47,16 @@ The default backend stack starts MariaDB, Redis, market data, signal, risk, ML, 
 docker compose -f docker-compose.prod.yml --env-file .env up -d --build
 docker compose -f docker-compose.prod.yml --env-file .env --profile ui up -d horizon-ui
 ```
+
+## See Performance
+
+From Ubuntu CLI:
+
+```bash
+bash scripts/horizonctl.sh performance
+bash scripts/horizonctl.sh performance-json
+```
+
+From the UI, open the Streamlit dashboard and switch to `Trading Dashboard`.
 
 For the full operational runbook, see [README_RUN.md](README_RUN.md).

@@ -100,7 +100,19 @@ cd /opt/horizon-lab
 bash scripts/healthcheck_ubuntu.sh
 ```
 
-## 8. Logs
+## 8. Performance From CLI
+
+The UI is optional. Backend performance can be checked from the prompt:
+
+```bash
+cd /home/myts/superbot
+bash scripts/horizonctl.sh performance
+bash scripts/horizonctl.sh performance-json
+```
+
+The report includes equity, daily P&L, realized/unrealized P&L, drawdown, risk state, drift state, worker heartbeats, order counts, open positions, active ML model metrics, recent signals, recent orders, and recent backtests.
+
+## 9. Logs
 
 ```bash
 docker compose -f docker-compose.prod.yml --env-file .env logs -f worker-signal
@@ -108,7 +120,7 @@ docker compose -f docker-compose.prod.yml --env-file .env logs -f worker-ml
 docker compose -f docker-compose.prod.yml --env-file .env logs -f worker-order
 ```
 
-## 9. Database
+## 10. Database
 
 MariaDB schema is bootstrapped from:
 
@@ -118,14 +130,14 @@ sql/init/001_schema.sql
 
 The app also runs idempotent schema initialization at startup.
 
-## 10. Stop
+## 11. Stop
 
 ```bash
 sudo systemctl stop horizon-ui
 sudo systemctl stop horizon-backend
 ```
 
-## 11. Update Release
+## 12. Update Release
 
 ```bash
 cd /opt/horizon-lab
@@ -134,7 +146,7 @@ sudo systemctl restart horizon-backend
 sudo systemctl restart horizon-ui
 ```
 
-## 12. Secret Hygiene
+## 13. Secret Hygiene
 
 - Commit only `.env.example` and `.env.production.example`; both must contain blank or placeholder values only.
 - Never commit `.env`, `.env.production`, `.env.staging`, or any environment-specific file.
