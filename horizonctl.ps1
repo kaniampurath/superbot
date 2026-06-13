@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("start-backend", "start-ui", "local-ui", "health", "status", "performance", "performance-json", "migrate-db", "stop")]
+    [ValidateSet("start-backend", "start-ui", "local-ui", "health", "status", "performance", "performance-json", "validate-once", "test-headless", "migrate-db", "stop")]
     [string]$Action = "health"
 )
 
@@ -67,7 +67,7 @@ function Invoke-Health {
         if (-not $daemonOk) { $failed = $true }
 
         $services = docker compose config --services
-        $backendHasNoUi = ($services -contains "worker-signal") -and -not ($services -contains "horizon-ui")
+        $backendHasNoUi = ($services -contains "worker-signal") -and ($services -contains "worker-validation") -and -not ($services -contains "horizon-ui")
         Write-Check "headless backend default" $backendHasNoUi ("services=" + (($services -join ",")))
 
         $uiServices = docker compose --profile ui config --services
@@ -134,6 +134,21 @@ switch ($Action) {
             docker compose run --rm --no-deps worker-signal python scripts/performance_report.py --env-file .env.example --json
         } else {
             python scripts/performance_report.py --env-file .env.example --json
+        }
+    }
+    "validate-once" {
+        if (Invoke-NativeOk { docker info }) {
+            docker compose run --rm --no-deps worker-validation python horizon_institutional_live_production_grade.py validation-once
+        } else {
+            $env:RUN_MODE = "validation-once"
+            python horizon_institutional_live_production_grade.py
+        }
+    }
+    "test-headless" {
+        if (Invoke-NativeOk { docker info }) {
+            docker compose run --rm --no-deps worker-validation python scripts/headless_functional_test.py
+        } else {
+            python scripts/headless_functional_test.py
         }
     }
     "migrate-db" {

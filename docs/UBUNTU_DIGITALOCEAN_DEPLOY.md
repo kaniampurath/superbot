@@ -122,9 +122,11 @@ The UI is optional. Backend performance can be checked from the prompt:
 cd /home/myts/superbot
 bash scripts/horizonctl.sh performance
 bash scripts/horizonctl.sh performance-json
+bash scripts/horizonctl.sh validate-once
+bash scripts/horizonctl.sh test-headless
 ```
 
-The report includes equity, daily P&L, realized/unrealized P&L, drawdown, risk state, drift state, worker heartbeats, order counts, open positions, active ML model metrics, recent signals, recent orders, and recent backtests.
+The report includes equity, daily P&L, realized/unrealized P&L, drawdown, risk state, drift state, worker heartbeats, order counts, open positions, active ML model metrics, recent signals, recent orders, validation state, and recent handoffs. `test-headless` verifies that the backend can run without Streamlit while preserving validation, journal, handoff, and order-gate data.
 
 ## 9. Logs
 
@@ -143,6 +145,14 @@ sql/init/001_schema.sql
 ```
 
 The app also runs idempotent schema initialization at startup.
+
+After pulling a release with database changes, run:
+
+```bash
+cd /home/myts/superbot
+bash scripts/horizonctl.sh migrate-db
+bash scripts/horizonctl.sh test-headless
+```
 
 ## 11. Stop
 

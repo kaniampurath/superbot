@@ -114,7 +114,7 @@ def build_report() -> dict[str, Any]:
     risk = redis_json(client, "risk_state")
     drift = redis_json(client, "drift_state")
     workers = []
-    for worker in ["worker-marketdata", "worker-signal", "worker-risk", "worker-ml", "worker-order", "worker-pnl"]:
+    for worker in ["worker-marketdata", "worker-validation", "worker-signal", "worker-risk", "worker-ml", "worker-order", "worker-pnl"]:
         payload = redis_json(client, f"worker_status:{worker}")
         workers.append({"worker": worker, "status": payload.get("status", "OFFLINE"), "last_seen": payload.get("last_seen", ""), "detail": payload.get("detail", {})})
     if conn is not None and all(row["status"] == "OFFLINE" for row in workers):
@@ -149,6 +149,8 @@ def build_report() -> dict[str, Any]:
         "open_positions": query_scalar(conn, "SELECT COUNT(*) AS n FROM positions WHERE status='OPEN'"),
         "active_model": (query_rows(conn, "SELECT version, status, trained_rows, metrics_json, trained_at FROM model_registry WHERE status='ACTIVE' ORDER BY trained_at DESC LIMIT 1") or [{}])[0],
         "latest_signals": query_rows(conn, "SELECT symbol, side, price, composite_score, ml_confidence, deployable, validation_status, risk_status, ts FROM signals ORDER BY id DESC LIMIT 10"),
+        "validation": query_rows(conn, "SELECT symbol, status, total_trades, win_rate, profit_factor, expectancy, max_drawdown, updated_at FROM validation_state ORDER BY updated_at DESC LIMIT 10"),
+        "recent_handoffs": query_rows(conn, "SELECT created_at, stage, symbol, status, next_owner, reason FROM handoff_events ORDER BY id DESC LIMIT 12"),
         "recent_orders": query_rows(conn, "SELECT created_at, symbol, side, mode, status, requested_size_usdt, block_reason FROM deployment_requests ORDER BY id DESC LIMIT 10"),
         "positions": query_rows(conn, "SELECT symbol, side, entry_price, current_price, size_usdt, unrealized_pnl, realized_pnl, status, updated_at FROM positions ORDER BY id DESC LIMIT 10"),
     }
@@ -180,6 +182,14 @@ def print_human(report: dict[str, Any]) -> None:
     print("\nWorkers")
     for row in report["workers"]:
         print(f"  {row.get('worker'):<18} {row.get('status', 'UNKNOWN'):<10} {row.get('last_seen', '')}")
+    print("\nValidation")
+    for row in report.get("validation", [])[:6]:
+        expectancy_bps = float(row.get("expectancy", 0) or 0) * 10000
+        max_dd_pct = abs(float(row.get("max_drawdown", 0) or 0)) * 100
+        print(f"  {row.get('symbol',''):<8} {row.get('status',''):<6} trades={int(row.get('total_trades', 0) or 0):<4} pf={float(row.get('profit_factor', 0) or 0):.2f} exp={expectancy_bps:.1f}bps dd={max_dd_pct:.1f}%")
+    print("\nRecent handoffs")
+    for row in report.get("recent_handoffs", [])[:6]:
+        print(f"  {row.get('stage',''):<12} {row.get('symbol',''):<8} {row.get('status',''):<6} -> {row.get('next_owner',''):<18} {row.get('reason','')}")
     print("\nLatest signals")
     for row in report["latest_signals"][:6]:
         print(f"  {row.get('symbol',''):<8} {row.get('side',''):<5} score={float(row.get('composite_score', 0) or 0):>6.2f} ml={float(row.get('ml_confidence', 0) or 0):.2f} deployable={row.get('deployable')} ts={row.get('ts','')}")

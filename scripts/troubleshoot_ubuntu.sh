@@ -87,7 +87,7 @@ run "compose ps" compose ps
 run "containers" docker ps --format "table {{.ID}}\t{{.Names}}\t{{.Image}}\t{{.Status}}\t{{.Ports}}"
 
 section "Service Logs"
-run "backend worker logs" compose logs --tail "$TAIL_LINES" worker-marketdata worker-signal worker-risk worker-ml worker-order worker-pnl
+run "backend worker logs" compose logs --tail "$TAIL_LINES" worker-marketdata worker-validation worker-signal worker-risk worker-ml worker-order worker-pnl
 run "ui logs" compose --profile ui logs --tail "$TAIL_LINES" horizon-ui
 run "mariadb logs" compose logs --tail "$TAIL_LINES" mariadb
 run "redis logs" compose logs --tail "$TAIL_LINES" redis

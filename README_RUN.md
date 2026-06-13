@@ -150,11 +150,13 @@ Actions:
 | Action | Purpose |
 |---|---|
 | `health` | Compile check, Docker Compose validation, backend/UI profile check, credential presence check, current service status, and UI health probe |
-| `start-backend` | Starts the headless backend only: MariaDB, Redis, market data, signal, risk, ML, order, and P&L workers |
+| `start-backend` | Starts the headless backend only: MariaDB, Redis, market data, validation, signal, risk, ML, order, and P&L workers |
 | `start-ui` | Starts backend plus optional Streamlit UI using the `ui` profile |
 | `local-ui` | Runs only the local Streamlit UI process from the prompt |
 | `performance` | Prints equity, P&L, drawdown, risk, drift, worker status, orders, model metrics, and latest signals from backend state |
 | `performance-json` | Prints the same report as JSON for scripts and monitoring |
+| `validate-once` | Runs one headless validation/backtest cycle and prints symbol statuses |
+| `test-headless` | Runs functional and performance scenarios proving backend handoffs work without the UI |
 | `status` | Shows Docker service state and UI health |
 | `stop` | Stops backend and UI containers |
 
@@ -165,7 +167,18 @@ bash scripts/horizonctl.sh health
 bash scripts/horizonctl.sh status
 bash scripts/horizonctl.sh performance
 bash scripts/horizonctl.sh performance-json
+bash scripts/horizonctl.sh validate-once
+bash scripts/horizonctl.sh test-headless
 ```
+
+`test-headless` covers these production-readiness scenarios:
+
+| Scenario | What it proves |
+|---|---|
+| `validation_worker_headless` | Backtest/validation publishes Redis state, writes compact DB records, journals validation, emits handoff events, and prunes history without Streamlit |
+| `order_gate_requires_validation` | Training auto-approval does not send paper/testnet orders unless validation is green |
+| `ui_independence_contract` | Compose keeps the UI optional and the dashboard reads validation state rather than owning validation |
+| `validation_performance_budget` | A validation cycle stays inside a quick offline runtime budget and avoids bulky path storage by default |
 
 ## Local Run
 ```powershell
@@ -182,7 +195,16 @@ Copy `.env.example` and override values as needed. Secrets are read only from `t
 Paper trading is enabled by default. Deployment requires a deployable signal, risk OK, green validation, and manual approval in the UI. The UI queues a durable `deployment_requests` row; `worker-order` owns the final risk re-check, paper order creation, execution record, position open, Redis `live_position:{symbol}` update, and audit event.
 
 ## Training Auto-Approval
-`SYSTEM_STAGE=training`, `TRAINING_AUTO_APPROVE_PAPER=true`, and `AUTO_APPROVE_ORDER_MODE=TESTNET` allow `worker-signal` to queue small auto-approved Testnet deployment requests for candidate entries so the system can collect trade outcomes. Auto approval respects risk/drift, execution sanity, duplicate-position checks, ML confidence, symbol whitelist, and `TRAINING_AUTO_APPROVE_MAX_POSITION_USDT`. Switch `SYSTEM_STAGE=production` and `TRAINING_AUTO_APPROVE_PAPER=false` to restore the manual production-grade approval path.
+`SYSTEM_STAGE=training`, `TRAINING_AUTO_APPROVE_PAPER=true`, and `AUTO_APPROVE_ORDER_MODE=TESTNET` allow `worker-signal` to queue small auto-approved Testnet deployment requests for candidate entries so the system can collect trade outcomes. Auto approval respects validation, risk/drift, execution sanity, duplicate-position checks, ML confidence, symbol whitelist, and `TRAINING_AUTO_APPROVE_MAX_POSITION_USDT`. `TRAINING_AUTO_REQUIRES_VALIDATION=true` is the safety default; set it to `false` only for deliberate research data collection. Switch `SYSTEM_STAGE=production` and `TRAINING_AUTO_APPROVE_PAPER=false` to restore the manual production-grade approval path.
+
+## Headless Validation Worker
+`worker-validation` owns backtest, rolling validation, walk-forward, and Monte Carlo checks. It publishes `latest_validation:{symbol}` in Redis, upserts one compact current row per symbol in `validation_state`, writes compact history to validation run tables, records `VALIDATION_PASS`, `VALIDATION_WARN`, or `VALIDATION_FAIL` journal entries, and creates `handoff_events` for signal/order troubleshooting.
+
+Storage is controlled by `VALIDATION_WORKER_SECONDS`, `VALIDATION_BACKTEST_BARS`, `VALIDATION_HISTORY_DAYS`, and `VALIDATION_STORE_PATHS=false`. The default keeps summary metrics and avoids storing bulky equity/worst-path arrays. Run one cycle manually with:
+
+```bash
+bash scripts/horizonctl.sh validate-once
+```
 
 ## Mean-Reversion Strategy Defaults
 The deployable strategy is short-term mean reversion on `STRATEGY_INTERVAL=15m`. Default gates are `abs(z) >= 2.7`, BUY only when `RSI <= 35`, SELL only when `RSI >= 65`, `volume_z >= -0.5`, taker-flow confirmation, low-trend regime with `ADX <= 22`, falling realized volatility, expected mean-reversion move at least `3x` round-trip cost, and order-book confirmation. A 4h trend guard blocks shorts in strong higher-timeframe uptrends and buys in strong higher-timeframe downtrends. Deployment requires green full and rolling validation: profit factor >= `1.2`, expectancy >= `5` bps, and max validation drawdown <= `8%`.
@@ -198,15 +220,22 @@ Model promotion is governed. `worker-ml` combines fresh candle-derived labels wi
 
 Learning quality is also guarded. `ML_BALANCE_CLASSES=true` reweights positive/negative labels during training, `ML_CANDIDATE_QUALITY_WEIGHT` gives stronger candidate rows more influence, and `ML_DRIFT_GATE_ENABLED=true` blocks deployment when top model features drift beyond `ML_DRIFT_BLOCK_THRESHOLD`. The Model Learning dashboard shows the current inference, label conversion, rolling 7/14/30 day validation, feature importance, feature drift, expected-vs-actual reversion, and execution quality.
 
+## Journal and Auto Feedback
+The system keeps a structured `trading_journal` in MariaDB in addition to the audit log. Audit tells what happened; journal records why it mattered and how it should be used for learning. When `worker-signal` emits a BUY candidate it automatically writes `SIG_BUY`; SELL writes `SIG_SELL`; blocked candidates write `SIG_BLOCKED`; training auto-approval writes `AUTO_APPROVED`; order handling writes `ORDER_EXECUTED` or `ORDER_BLOCKED`; outcome labeling writes `OUTCOME_WIN` or `OUTCOME_LOSS`; model promotion writes `MODEL_PROMOTED` or `MODEL_REJECTED`; validation writes `VALIDATION_PASS`, `VALIDATION_WARN`, or `VALIDATION_FAIL`.
+
+Journal rows store symbol, side, signal key, model version, confidence, expected reversion, feature JSON, context JSON, and lesson JSON. The Journal dashboard page shows recent entries, code glossary, and 7-day auto-feedback counts so you can confirm the feedback loop is active.
+
+The Journal dashboard also provides an Excel-compatible download. The export flattens reason, blockers, suggested change, ML feature values, context, and lesson fields so reviews can be filtered by signal type, blocker, outcome, return, or feature bucket and then converted into strategy changes.
+
 ## Optional Testnet Mode
 `ENABLE_REAL_TESTNET_ORDERS=true` is the default. Provide Binance Spot Testnet credentials and use tiny order sizes only. In production stage, Testnet deployment should remain manually approved unless you explicitly keep auto approval enabled.
 In training mode, auto-approved Testnet orders require valid Spot Testnet credentials and are submitted only to `https://testnet.binance.vision`.
 
 ## MariaDB Usage
-MariaDB is the source of record. Signals, deployment requests, order attempts, executions, positions, P&L snapshots, risk events, audit rows, validation runs, ML feature snapshots, ML predictions, model registry rows, trade outcomes, and worker heartbeats are persisted.
+MariaDB is the source of record. Signals, deployment requests, order attempts, executions, positions, P&L snapshots, risk events, audit rows, compact validation state/history, handoff events, ML feature snapshots, ML predictions, model registry rows, trade outcomes, journal rows, and worker heartbeats are persisted.
 
 ## Redis Usage
-Redis stores latest state, pub-sub messages, worker health, and duplicate-prevention locks. Redis is disposable and rebuilt from MariaDB where practical. Important latest-state keys include `latest_price:{symbol}`, `latest_orderbook:{symbol}`, `latest_cross_exchange:{symbol}`, `latest_signal:{symbol}`, `live_position:{symbol}`, `live_pnl`, `risk_state`, `drift_state`, and `worker_status:{worker}`. Important channels include `market_ticks`, `orderbook_updates`, `signal_updates`, `pnl_updates`, `risk_events`, `audit_events`, and `audit_updates`.
+Redis stores latest state, pub-sub messages, worker health, and duplicate-prevention locks. Redis is disposable and rebuilt from MariaDB where practical. Important latest-state keys include `latest_price:{symbol}`, `latest_orderbook:{symbol}`, `latest_cross_exchange:{symbol}`, `latest_validation:{symbol}`, `latest_signal:{symbol}`, `live_position:{symbol}`, `live_pnl`, `risk_state`, `drift_state`, and `worker_status:{worker}`. Important channels include `market_ticks`, `orderbook_updates`, `validation_updates`, `signal_updates`, `pnl_updates`, `risk_events`, `journal_events`, `handoff_events`, `audit_events`, and `audit_updates`.
 
 ## Position Lifecycle
 The order worker opens paper positions after manual approval and final gate checks. The P&L worker marks positions to market and closes paper positions on stop-loss hit, take-profit hit, or risk-lock exit. Every close writes an execution, updates the position, publishes audit events, and persists an immutable audit row.

@@ -67,6 +67,20 @@ case "$ACTION" in
       python scripts/performance_report.py --env-file "$ENV_FILE" --json
     fi
     ;;
+  validate-once)
+    if docker_ready; then
+      compose run --rm --no-deps worker-validation python horizon_institutional_live_production_grade.py validation-once
+    else
+      RUN_MODE=validation-once python horizon_institutional_live_production_grade.py
+    fi
+    ;;
+  test-headless)
+    if docker_ready; then
+      compose run --rm --no-deps worker-validation python scripts/headless_functional_test.py
+    else
+      python scripts/headless_functional_test.py
+    fi
+    ;;
   migrate-db)
     if docker_ready; then
       compose up -d mariadb redis
@@ -80,7 +94,7 @@ case "$ACTION" in
     compose --profile ui down
     ;;
   *)
-    echo "Usage: scripts/horizonctl.sh {start-backend|start-ui|health|status|logs|db|redis|troubleshoot|performance|performance-json|migrate-db|stop}"
+    echo "Usage: scripts/horizonctl.sh {start-backend|start-ui|health|status|logs|db|redis|troubleshoot|performance|performance-json|validate-once|test-headless|migrate-db|stop}"
     exit 2
     ;;
 esac

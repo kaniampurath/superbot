@@ -52,6 +52,18 @@ services:
       redis:
         condition: service_healthy
 
+  worker-validation:
+    build: .
+    restart: unless-stopped
+    env_file: ${HORIZON_ENV_FILE:-.env}
+    environment:
+      RUN_MODE: validation
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   worker-risk:
     build: .
     restart: unless-stopped

@@ -28,6 +28,8 @@ sudo systemctl start horizon-backend
 sudo systemctl start horizon-ui
 bash scripts/healthcheck_ubuntu.sh
 bash scripts/horizonctl.sh migrate-db
+bash scripts/horizonctl.sh validate-once
+bash scripts/horizonctl.sh test-headless
 bash scripts/horizonctl.sh performance
 ```
 
@@ -45,7 +47,7 @@ The installer checks the existing setup before installing: app directory, git ch
 
 ## What Runs Headless
 
-The default backend stack starts MariaDB, Redis, market data, signal, risk, ML, order management, and P&L workers. The Streamlit UI is separate and optional.
+The default backend stack starts MariaDB, Redis, market data, validation/backtest, signal, risk, ML, order management, and P&L workers. The Streamlit UI is separate and optional.
 
 ```bash
 docker compose -f docker-compose.prod.yml --env-file .env up -d --build
@@ -59,6 +61,8 @@ From Ubuntu CLI:
 ```bash
 bash scripts/horizonctl.sh performance
 bash scripts/horizonctl.sh performance-json
+bash scripts/horizonctl.sh validate-once
+bash scripts/horizonctl.sh test-headless
 ```
 
 From the UI, open the Streamlit dashboard and switch to `Trading Dashboard`.
@@ -76,6 +80,8 @@ sudo systemctl restart horizon-ui
 bash scripts/horizonctl.sh status
 bash scripts/horizonctl.sh health
 bash scripts/horizonctl.sh migrate-db
+bash scripts/horizonctl.sh validate-once
+bash scripts/horizonctl.sh test-headless
 bash scripts/horizonctl.sh performance
 bash scripts/horizonctl.sh troubleshoot
 ```
@@ -84,13 +90,15 @@ Useful direct consoles:
 
 ```bash
 bash scripts/horizonctl.sh logs
-bash scripts/horizonctl.sh logs worker-ml worker-signal worker-order
+bash scripts/horizonctl.sh logs worker-validation worker-ml worker-signal worker-order
 bash scripts/horizonctl.sh migrate-db
 bash scripts/horizonctl.sh db
 bash scripts/horizonctl.sh redis
 ```
 
 `migrate-db` runs the app's idempotent schema bootstrap and migration list against MariaDB. Use it after pulling a release that adds or changes tables.
+
+`test-headless` runs backend-only functional and performance checks. It proves validation/backtest can run without the UI, compact DB records and handoff events are produced, and training auto-approval is blocked unless validation is green.
 
 `troubleshoot` prints git deployment state, redacted runtime config, host capacity, systemd status, Docker Compose state, recent service logs, Redis state, MariaDB counts, worker heartbeat, active model registry rows, recent signals, open positions, audit events, health, and performance. Secrets are reported only as `<set>` or `<missing-or-placeholder>`.
 

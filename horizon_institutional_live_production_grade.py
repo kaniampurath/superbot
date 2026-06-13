@@ -85,6 +85,25 @@ def format_profit_factor(value: Any) -> str:
     return f"{profit_factor:.2f}"
 
 
+def json_safe(value: Any) -> Any:
+    if isinstance(value, dict):
+        return {str(key): json_safe(item) for key, item in value.items()}
+    if isinstance(value, list):
+        return [json_safe(item) for item in value]
+    if isinstance(value, tuple):
+        return [json_safe(item) for item in value]
+    if isinstance(value, (np.integer,)):
+        return int(value)
+    if isinstance(value, (np.floating, float)):
+        numeric = float(value)
+        return numeric if np.isfinite(numeric) else 0.0
+    if isinstance(value, pd.Timestamp):
+        return value.isoformat()
+    if isinstance(value, datetime):
+        return value.isoformat()
+    return value
+
+
 @dataclass(frozen=True)
 class Config:
     run_mode: str = env_str("RUN_MODE", "ui")
@@ -118,6 +137,11 @@ class Config:
     orderbook_confirmation_min_obi: float = env_float("ORDERBOOK_CONFIRMATION_MIN_OBI", -0.10)
     orderbook_confirmation_max_obi: float = env_float("ORDERBOOK_CONFIRMATION_MAX_OBI", 0.10)
     rolling_validation_trades: int = env_int("ROLLING_VALIDATION_TRADES", 30)
+    validation_worker_seconds: int = env_int("VALIDATION_WORKER_SECONDS", 900)
+    validation_backtest_bars: int = env_int("VALIDATION_BACKTEST_BARS", 360)
+    validation_history_days: int = env_int("VALIDATION_HISTORY_DAYS", 14)
+    validation_store_paths: bool = env_bool("VALIDATION_STORE_PATHS", False)
+    training_auto_requires_validation: bool = env_bool("TRAINING_AUTO_REQUIRES_VALIDATION", True)
     ml_enabled: bool = env_bool("ML_ENABLED", True)
     ml_confidence_gate_enabled: bool = env_bool("ML_CONFIDENCE_GATE_ENABLED", True)
     min_ml_confidence: float = env_float("MIN_ML_CONFIDENCE", 0.62)
@@ -278,6 +302,8 @@ SCHEMA_SQL = [
     """CREATE TABLE IF NOT EXISTS backtest_trades (id BIGINT PRIMARY KEY AUTO_INCREMENT, run_id BIGINT, symbol VARCHAR(24), side VARCHAR(8), entry_price DOUBLE, exit_price DOUBLE, pnl DOUBLE, r_multiple DOUBLE, entry_time DATETIME(6), exit_time DATETIME(6))""",
     """CREATE TABLE IF NOT EXISTS walk_forward_runs (id BIGINT PRIMARY KEY AUTO_INCREMENT, symbol VARCHAR(24), train_perf DOUBLE, test_perf DOUBLE, degradation_pct DOUBLE, parameter_stability DOUBLE, status VARCHAR(20), overfit_warning TEXT, ts DATETIME(6))""",
     """CREATE TABLE IF NOT EXISTS monte_carlo_runs (id BIGINT PRIMARY KEY AUTO_INCREMENT, symbol VARCHAR(24), median_ending_equity DOUBLE, p5_ending_equity DOUBLE, p95_ending_equity DOUBLE, prob_dd_breach DOUBLE, prob_ruin DOUBLE, expected_max_dd DOUBLE, worst_path_json JSON, ts DATETIME(6))""",
+    """CREATE TABLE IF NOT EXISTS validation_state (symbol VARCHAR(24) PRIMARY KEY, status VARCHAR(20), total_trades INT, win_rate DOUBLE, profit_factor DOUBLE, expectancy DOUBLE, max_drawdown DOUBLE, rolling_profit_factor DOUBLE, rolling_expectancy DOUBLE, walk_status VARCHAR(20), monte_status VARCHAR(20), summary_json JSON, updated_at DATETIME(6), KEY idx_validation_updated(updated_at))""",
+    """CREATE TABLE IF NOT EXISTS handoff_events (id BIGINT PRIMARY KEY AUTO_INCREMENT, idempotency_key VARCHAR(220) UNIQUE, stage VARCHAR(40), symbol VARCHAR(24), status VARCHAR(20), input_ref VARCHAR(180), output_ref VARCHAR(180), next_owner VARCHAR(80), reason TEXT, metadata_json JSON, created_at DATETIME(6), KEY idx_handoff_stage_created(stage, created_at), KEY idx_handoff_symbol_created(symbol, created_at))""",
     """CREATE TABLE IF NOT EXISTS feature_snapshots (id BIGINT PRIMARY KEY AUTO_INCREMENT, idempotency_key VARCHAR(180) UNIQUE, symbol VARCHAR(24), side VARCHAR(8), strategy_interval VARCHAR(16), feature_json JSON, source VARCHAR(40), ts DATETIME(6), KEY idx_feature_symbol_ts(symbol, ts))""",
     """CREATE TABLE IF NOT EXISTS trade_outcomes (id BIGINT PRIMARY KEY AUTO_INCREMENT, feature_id BIGINT NULL, idempotency_key VARCHAR(180) UNIQUE, symbol VARCHAR(24), side VARCHAR(8), label INT, forward_return DOUBLE, max_favorable_bps DOUBLE, max_adverse_bps DOUBLE, horizon_bars INT, outcome_json JSON, ts DATETIME(6))""",
     """CREATE TABLE IF NOT EXISTS model_registry (id BIGINT PRIMARY KEY AUTO_INCREMENT, model_name VARCHAR(80), version VARCHAR(80), status VARCHAR(30), feature_list_json JSON, feature_importance_json JSON, model_json JSON, metrics_json JSON, trained_rows INT, trained_at DATETIME(6), KEY idx_model_status(model_name, status, trained_at))""",
@@ -285,6 +311,7 @@ SCHEMA_SQL = [
     """CREATE TABLE IF NOT EXISTS drift_snapshots (id BIGINT PRIMARY KEY AUTO_INCREMENT, live_win_rate DOUBLE, backtest_win_rate DOUBLE, live_expectancy DOUBLE, backtest_expectancy DOUBLE, live_slippage_bps DOUBLE, modeled_slippage_bps DOUBLE, live_trade_frequency DOUBLE, expected_trade_frequency DOUBLE, live_drawdown DOUBLE, expected_drawdown DOUBLE, status VARCHAR(20), ts DATETIME(6))""",
     """CREATE TABLE IF NOT EXISTS risk_events (id BIGINT PRIMARY KEY AUTO_INCREMENT, event_type VARCHAR(80), severity VARCHAR(20), message TEXT, state_json JSON, ts DATETIME(6))""",
     """CREATE TABLE IF NOT EXISTS audit_log (id BIGINT PRIMARY KEY AUTO_INCREMENT, event_type VARCHAR(80), actor VARCHAR(80), symbol VARCHAR(24), message TEXT, metadata_json JSON, ts DATETIME(6))""",
+    """CREATE TABLE IF NOT EXISTS trading_journal (id BIGINT PRIMARY KEY AUTO_INCREMENT, idempotency_key VARCHAR(220) UNIQUE, journal_code VARCHAR(40), journal_type VARCHAR(40), severity VARCHAR(20), actor VARCHAR(80), symbol VARCHAR(24), side VARCHAR(8), signal_key VARCHAR(180), model_version VARCHAR(80), confidence DOUBLE, expected_reversion_bps DOUBLE, actual_outcome INT NULL, actual_return DOUBLE NULL, feature_json JSON, context_json JSON, lesson_json JSON, created_at DATETIME(6), KEY idx_journal_code_created(journal_code, created_at), KEY idx_journal_symbol_created(symbol, created_at))""",
     """CREATE TABLE IF NOT EXISTS worker_heartbeat (worker_name VARCHAR(80) PRIMARY KEY, status VARCHAR(30), pid INT, host VARCHAR(120), last_seen DATETIME(6), detail_json JSON)""",
 ]
 
@@ -300,6 +327,9 @@ SCHEMA_MIGRATIONS = [
     "ALTER TABLE ml_predictions ADD COLUMN IF NOT EXISTS actual_return DOUBLE NULL",
     "ALTER TABLE ml_predictions ADD COLUMN IF NOT EXISTS training_date DATETIME(6) NULL",
     "ALTER TABLE ml_predictions ADD COLUMN IF NOT EXISTS evaluated_at DATETIME(6) NULL",
+    "CREATE TABLE IF NOT EXISTS trading_journal (id BIGINT PRIMARY KEY AUTO_INCREMENT, idempotency_key VARCHAR(220) UNIQUE, journal_code VARCHAR(40), journal_type VARCHAR(40), severity VARCHAR(20), actor VARCHAR(80), symbol VARCHAR(24), side VARCHAR(8), signal_key VARCHAR(180), model_version VARCHAR(80), confidence DOUBLE, expected_reversion_bps DOUBLE, actual_outcome INT NULL, actual_return DOUBLE NULL, feature_json JSON, context_json JSON, lesson_json JSON, created_at DATETIME(6), KEY idx_journal_code_created(journal_code, created_at), KEY idx_journal_symbol_created(symbol, created_at))",
+    "CREATE TABLE IF NOT EXISTS validation_state (symbol VARCHAR(24) PRIMARY KEY, status VARCHAR(20), total_trades INT, win_rate DOUBLE, profit_factor DOUBLE, expectancy DOUBLE, max_drawdown DOUBLE, rolling_profit_factor DOUBLE, rolling_expectancy DOUBLE, walk_status VARCHAR(20), monte_status VARCHAR(20), summary_json JSON, updated_at DATETIME(6), KEY idx_validation_updated(updated_at))",
+    "CREATE TABLE IF NOT EXISTS handoff_events (id BIGINT PRIMARY KEY AUTO_INCREMENT, idempotency_key VARCHAR(220) UNIQUE, stage VARCHAR(40), symbol VARCHAR(24), status VARCHAR(20), input_ref VARCHAR(180), output_ref VARCHAR(180), next_owner VARCHAR(80), reason TEXT, metadata_json JSON, created_at DATETIME(6), KEY idx_handoff_stage_created(stage, created_at), KEY idx_handoff_symbol_created(symbol, created_at))",
 ]
 
 
@@ -331,6 +361,116 @@ def db_execute(engine: Engine | None, statement: str, params: dict[str, Any]) ->
             conn.execute(text(statement), params)
     except SQLAlchemyError:
         return
+
+
+JOURNAL_CODES: dict[str, dict[str, str]] = {
+    "SIG_BUY": {"type": "SIGNAL", "severity": "INFO", "meaning": "Buy candidate generated"},
+    "SIG_SELL": {"type": "SIGNAL", "severity": "INFO", "meaning": "Sell candidate generated"},
+    "SIG_HOLD": {"type": "SIGNAL", "severity": "INFO", "meaning": "No-trade scan recorded"},
+    "SIG_BLOCKED": {"type": "GATE", "severity": "AMBER", "meaning": "Candidate blocked by model, risk, drift, liquidity, or config"},
+    "AUTO_APPROVED": {"type": "APPROVAL", "severity": "INFO", "meaning": "Training auto-approval queued a paper/testnet request"},
+    "ORDER_EXECUTED": {"type": "EXECUTION", "severity": "INFO", "meaning": "Order request created a paper/testnet position"},
+    "ORDER_BLOCKED": {"type": "EXECUTION", "severity": "AMBER", "meaning": "Order request blocked by final execution gate"},
+    "OUTCOME_WIN": {"type": "FEEDBACK", "severity": "INFO", "meaning": "Prediction outcome was profitable or favorable"},
+    "OUTCOME_LOSS": {"type": "FEEDBACK", "severity": "WARNING", "meaning": "Prediction outcome was unprofitable or unfavorable"},
+    "MODEL_PROMOTED": {"type": "MODEL", "severity": "INFO", "meaning": "Candidate model promoted to active"},
+    "MODEL_REJECTED": {"type": "MODEL", "severity": "WARNING", "meaning": "Candidate model rejected by promotion gates"},
+    "VALIDATION_PASS": {"type": "VALIDATION", "severity": "INFO", "meaning": "Backtest, walk-forward, and Monte Carlo validation passed"},
+    "VALIDATION_WARN": {"type": "VALIDATION", "severity": "AMBER", "meaning": "Validation has warnings or insufficient evidence"},
+    "VALIDATION_FAIL": {"type": "VALIDATION", "severity": "WARNING", "meaning": "Validation failed a required safety or performance gate"},
+}
+
+
+def journal_write(
+    engine: Engine | None,
+    state: RedisState | None,
+    *,
+    key: str,
+    code: str,
+    actor: str,
+    symbol: str = "",
+    side: str = "",
+    signal_key: str = "",
+    model_version: str = "",
+    confidence: float | None = None,
+    expected_reversion_bps: float | None = None,
+    actual_outcome: int | None = None,
+    actual_return: float | None = None,
+    features: dict[str, Any] | None = None,
+    context: dict[str, Any] | None = None,
+    lesson: dict[str, Any] | None = None,
+) -> None:
+    spec = JOURNAL_CODES.get(code, {"type": "SYSTEM", "severity": "INFO", "meaning": code})
+    payload = {
+        "idempotency_key": key,
+        "journal_code": code,
+        "journal_type": spec["type"],
+        "severity": spec["severity"],
+        "actor": actor,
+        "symbol": symbol,
+        "side": side,
+        "signal_key": signal_key,
+        "model_version": model_version,
+        "confidence": confidence,
+        "expected_reversion_bps": expected_reversion_bps,
+        "actual_outcome": actual_outcome,
+        "actual_return": actual_return,
+        "feature_json": json.dumps(features or {}),
+        "context_json": json.dumps({**(context or {}), "meaning": spec.get("meaning", code)}),
+        "lesson_json": json.dumps(lesson or {}),
+        "created_at": now_utc().replace(tzinfo=None),
+    }
+    db_execute(
+        engine,
+        """INSERT IGNORE INTO trading_journal(idempotency_key, journal_code, journal_type, severity, actor, symbol, side, signal_key, model_version, confidence, expected_reversion_bps, actual_outcome, actual_return, feature_json, context_json, lesson_json, created_at)
+           VALUES(:idempotency_key, :journal_code, :journal_type, :severity, :actor, :symbol, :side, :signal_key, :model_version, :confidence, :expected_reversion_bps, :actual_outcome, :actual_return, :feature_json, :context_json, :lesson_json, :created_at)""",
+        payload,
+    )
+    if state is not None:
+        state.publish("journal_events", payload)
+
+
+def journal_code_rows() -> pd.DataFrame:
+    return pd.DataFrame(
+        [{"Code": code, "Type": spec["type"], "Severity": spec["severity"], "Meaning": spec["meaning"]} for code, spec in JOURNAL_CODES.items()]
+    )
+
+
+def record_handoff(
+    engine: Engine | None,
+    state: RedisState | None,
+    *,
+    key: str,
+    stage: str,
+    symbol: str,
+    status: str,
+    input_ref: str,
+    output_ref: str,
+    next_owner: str,
+    reason: str,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    payload = {
+        "idempotency_key": key,
+        "stage": stage,
+        "symbol": symbol,
+        "status": status,
+        "input_ref": input_ref,
+        "output_ref": output_ref,
+        "next_owner": next_owner,
+        "reason": reason,
+        "metadata_json": json.dumps(metadata or {}),
+        "created_at": now_utc().replace(tzinfo=None),
+    }
+    db_execute(
+        engine,
+        """INSERT IGNORE INTO handoff_events(idempotency_key, stage, symbol, status, input_ref, output_ref, next_owner, reason, metadata_json, created_at)
+           VALUES(:idempotency_key, :stage, :symbol, :status, :input_ref, :output_ref, :next_owner, :reason, :metadata_json, :created_at)""",
+        payload,
+    )
+    if state is not None:
+        state.set_json(f"latest_handoff:{stage}:{symbol}", {**payload, "created_at": iso_now()}, ex=3600)
+        state.publish("handoff_events", {**payload, "created_at": iso_now()})
 
 
 def heartbeat(engine: Engine | None, state: RedisState, worker: str, status: str = "ONLINE", detail: dict[str, Any] | None = None) -> None:
@@ -1203,6 +1343,17 @@ def persist_model_candidate(engine: Engine | None, state: RedisState, model: dic
         )
     if status == "ACTIVE":
         state.set_json("ml_model:mean_reversion_entry_confidence", model, ex=CFG.ml_retrain_seconds)
+    journal_write(
+        engine,
+        state,
+        key=f"journal:{model['version']}:{'MODEL_PROMOTED' if status == 'ACTIVE' else 'MODEL_REJECTED'}",
+        code="MODEL_PROMOTED" if status == "ACTIVE" else "MODEL_REJECTED",
+        actor="worker-ml",
+        model_version=str(model.get("version", "")),
+        confidence=float(model.get("metrics", {}).get("accuracy", 0.0) or 0.0),
+        context={"status": status, "reason": reason, "metrics": model.get("metrics", {}), "features": model.get("features", [])},
+        lesson={"promotion_reason": reason, "trained_rows": model.get("metrics", {}).get("rows", 0)},
+    )
 
 
 def walk_forward_summary(trades: pd.DataFrame, folds: int = 5) -> dict[str, Any]:
@@ -1262,9 +1413,9 @@ def monte_carlo_summary(trades: pd.DataFrame, paths: int = 250) -> dict[str, Any
 
 
 def validation_snapshot(symbol: str, allow_live_fetch: bool = True) -> dict[str, Any]:
-    frame = fetch_binance_klines(symbol, CFG.strategy_interval, limit=360) if allow_live_fetch else None
+    frame = fetch_binance_klines(symbol, CFG.strategy_interval, limit=CFG.validation_backtest_bars) if allow_live_fetch else None
     if frame is None:
-        frame = synthetic_ohlcv(symbol, bars=360)
+        frame = synthetic_ohlcv(symbol, bars=CFG.validation_backtest_bars)
     trades = run_backtest_for_frame(symbol, frame)
     backtest = metrics_from_trades(trades)
     rolling = metrics_from_trades(trades.tail(CFG.rolling_validation_trades)) if not trades.empty else metrics_from_trades(trades)
@@ -1297,32 +1448,197 @@ def validation_snapshot(symbol: str, allow_live_fetch: bool = True) -> dict[str,
     return {"symbol": symbol, "backtest": backtest, "rolling": rolling, "walk_forward": walk, "monte_carlo": monte, "validation_status": validation_status, "trades": trades}
 
 
+def compact_validation_payload(snapshot: dict[str, Any]) -> dict[str, Any]:
+    backtest = snapshot["backtest"]
+    rolling = snapshot["rolling"]
+    walk = snapshot["walk_forward"]
+    monte = snapshot["monte_carlo"]
+    return json_safe({
+        "symbol": snapshot["symbol"],
+        "validation_status": snapshot["validation_status"],
+        "backtest": {
+            "total_trades": int(backtest.get("total_trades", 0) or 0),
+            "win_rate": float(backtest.get("win_rate", 0.0) or 0.0),
+            "profit_factor": float(backtest.get("profit_factor", 0.0) or 0.0),
+            "expectancy": float(backtest.get("expectancy", 0.0) or 0.0),
+            "avg_r": float(backtest.get("avg_r", 0.0) or 0.0),
+            "max_drawdown": float(backtest.get("max_drawdown", 0.0) or 0.0),
+            "sharpe_like": float(backtest.get("sharpe_like", 0.0) or 0.0),
+            "largest_winner": float(backtest.get("largest_winner", 0.0) or 0.0),
+            "largest_loser": float(backtest.get("largest_loser", 0.0) or 0.0),
+            "consecutive_losses": int(backtest.get("consecutive_losses", 0) or 0),
+            "performance_gate": backtest.get("performance_gate", {}),
+            "equity_curve": backtest.get("equity_curve", [])[-60:] if CFG.validation_store_paths else [],
+        },
+        "rolling": {
+            "total_trades": int(rolling.get("total_trades", 0) or 0),
+            "win_rate": float(rolling.get("win_rate", 0.0) or 0.0),
+            "profit_factor": float(rolling.get("profit_factor", 0.0) or 0.0),
+            "expectancy": float(rolling.get("expectancy", 0.0) or 0.0),
+            "max_drawdown": float(rolling.get("max_drawdown", 0.0) or 0.0),
+        },
+        "walk_forward": walk,
+        "monte_carlo": {**monte, "worst_path": monte.get("worst_path", [])[-60:] if CFG.validation_store_paths else []},
+        "updated_at": iso_now(),
+    })
+
+
 def persist_validation_snapshot(engine: Engine | None, snapshot: dict[str, Any]) -> None:
     if engine is None:
         return
     symbol = snapshot["symbol"]
+    compact = compact_validation_payload(snapshot)
     backtest = {
         key: (0.0 if isinstance(value, float) and not np.isfinite(value) else value)
-        for key, value in snapshot["backtest"].items()
+        for key, value in compact["backtest"].items()
+        if key != "performance_gate"
     }
-    walk = snapshot["walk_forward"]
-    monte = snapshot["monte_carlo"]
+    rolling = compact["rolling"]
+    walk = compact["walk_forward"]
+    monte = compact["monte_carlo"]
+    ts = now_utc().replace(tzinfo=None)
+    status = compact["validation_status"]
+    db_execute(
+        engine,
+        """INSERT INTO validation_state(symbol, status, total_trades, win_rate, profit_factor, expectancy, max_drawdown, rolling_profit_factor, rolling_expectancy, walk_status, monte_status, summary_json, updated_at)
+           VALUES(:symbol, :status, :total_trades, :win_rate, :profit_factor, :expectancy, :max_drawdown, :rolling_profit_factor, :rolling_expectancy, :walk_status, :monte_status, :summary_json, :updated_at)
+           ON DUPLICATE KEY UPDATE status=VALUES(status), total_trades=VALUES(total_trades), win_rate=VALUES(win_rate), profit_factor=VALUES(profit_factor), expectancy=VALUES(expectancy), max_drawdown=VALUES(max_drawdown), rolling_profit_factor=VALUES(rolling_profit_factor), rolling_expectancy=VALUES(rolling_expectancy), walk_status=VALUES(walk_status), monte_status=VALUES(monte_status), summary_json=VALUES(summary_json), updated_at=VALUES(updated_at)""",
+        {
+            "symbol": symbol,
+            "status": status,
+            "total_trades": backtest["total_trades"],
+            "win_rate": backtest["win_rate"],
+            "profit_factor": backtest["profit_factor"],
+            "expectancy": backtest["expectancy"],
+            "max_drawdown": backtest["max_drawdown"],
+            "rolling_profit_factor": rolling["profit_factor"],
+            "rolling_expectancy": rolling["expectancy"],
+            "walk_status": walk.get("status", "AMBER"),
+            "monte_status": monte.get("status", "AMBER"),
+            "summary_json": json.dumps(json_safe(compact)),
+            "updated_at": ts,
+        },
+    )
     db_execute(
         engine,
         """INSERT INTO backtest_runs(symbol, total_trades, win_rate, profit_factor, expectancy, avg_r, max_drawdown, sharpe_like, largest_winner, largest_loser, consecutive_losses, equity_curve_json, ts)
            VALUES(:symbol, :total_trades, :win_rate, :profit_factor, :expectancy, :avg_r, :max_drawdown, :sharpe_like, :largest_winner, :largest_loser, :consecutive_losses, :equity_curve_json, :ts)""",
-        {**backtest, "symbol": symbol, "equity_curve_json": json.dumps(backtest["equity_curve"]), "ts": now_utc().replace(tzinfo=None)},
+        {**backtest, "symbol": symbol, "equity_curve_json": json.dumps(json_safe(backtest["equity_curve"] if CFG.validation_store_paths else [])), "ts": ts},
     )
     db_execute(
         engine,
         "INSERT INTO walk_forward_runs(symbol, train_perf, test_perf, degradation_pct, parameter_stability, status, overfit_warning, ts) VALUES(:symbol, :train_perf, :test_perf, :degradation_pct, :parameter_stability, :status, :overfit_warning, :ts)",
-        {**walk, "symbol": symbol, "ts": now_utc().replace(tzinfo=None)},
+        {**walk, "symbol": symbol, "ts": ts},
     )
     db_execute(
         engine,
         "INSERT INTO monte_carlo_runs(symbol, median_ending_equity, p5_ending_equity, p95_ending_equity, prob_dd_breach, prob_ruin, expected_max_dd, worst_path_json, ts) VALUES(:symbol, :median_ending_equity, :p5_ending_equity, :p95_ending_equity, :prob_dd_breach, :prob_ruin, :expected_max_dd, :worst_path_json, :ts)",
-        {**monte, "symbol": symbol, "worst_path_json": json.dumps(monte["worst_path"]), "ts": now_utc().replace(tzinfo=None)},
+        {**monte, "symbol": symbol, "worst_path_json": json.dumps(json_safe(monte["worst_path"] if CFG.validation_store_paths else [])), "ts": ts},
     )
+    retention = max(int(CFG.validation_history_days), 1)
+    for table in ["backtest_runs", "walk_forward_runs", "monte_carlo_runs"]:
+        db_execute(engine, f"DELETE FROM {table} WHERE ts < DATE_SUB(UTC_TIMESTAMP(), INTERVAL {retention} DAY)", {})
+
+
+def latest_validation_snapshot(state: RedisState, engine: Engine | None, symbol: str, fallback: bool = True) -> dict[str, Any]:
+    cached = state.get_json(f"latest_validation:{symbol}") if state.ok else None
+    if cached:
+        return cached
+    rows = db_rows(engine, "SELECT summary_json FROM validation_state WHERE symbol=:symbol", {"symbol": symbol})
+    if rows:
+        parsed = safe_json_dict(rows[0].get("summary_json"))
+        if parsed:
+            return parsed
+    return validation_snapshot(symbol, allow_live_fetch=False) if fallback else {"symbol": symbol, "validation_status": "AMBER", "backtest": metrics_from_trades(pd.DataFrame()), "rolling": metrics_from_trades(pd.DataFrame()), "walk_forward": {}, "monte_carlo": {}}
+
+
+def run_validation_cycle(state: RedisState, engine: Engine | None, use_locks: bool = True) -> dict[str, str]:
+    cycle_started = now_utc()
+    statuses: dict[str, str] = {}
+    for symbol in CFG.symbols:
+        if use_locks and not state.lock(f"lock:validation_worker:{symbol}", ttl=max(CFG.validation_worker_seconds - 5, 60)):
+            continue
+        try:
+            snapshot = validation_snapshot(symbol, allow_live_fetch=True)
+            compact = compact_validation_payload(snapshot)
+            persist_validation_snapshot(engine, snapshot)
+            state.set_json(f"latest_validation:{symbol}", compact, ex=max(CFG.validation_worker_seconds * 3, 1800))
+            state.publish("validation_updates", compact)
+            status = str(compact.get("validation_status", "AMBER"))
+            statuses[symbol] = status
+            code = "VALIDATION_PASS" if status == "GREEN" else "VALIDATION_FAIL" if status == "RED" else "VALIDATION_WARN"
+            backtest = compact["backtest"]
+            reason = (
+                f"{status}: trades={backtest.get('total_trades', 0)}, "
+                f"pf={format_profit_factor(backtest.get('profit_factor'))}, "
+                f"expectancy={float(backtest.get('expectancy', 0.0) or 0.0) * 10000:.1f}bps"
+            )
+            journal_write(
+                engine,
+                state,
+                key=f"journal:validation:{symbol}:{int(cycle_started.timestamp() // max(CFG.validation_worker_seconds, 1))}",
+                code=code,
+                actor="worker-validation",
+                symbol=symbol,
+                context={
+                    "status": status,
+                    "total_trades": backtest.get("total_trades", 0),
+                    "profit_factor": backtest.get("profit_factor", 0.0),
+                    "expectancy_bps": float(backtest.get("expectancy", 0.0) or 0.0) * 10000,
+                    "max_drawdown_pct": abs(float(backtest.get("max_drawdown", 0.0) or 0.0)) * 100,
+                    "walk_status": compact["walk_forward"].get("status"),
+                    "monte_status": compact["monte_carlo"].get("status"),
+                },
+                lesson={"next_owner": "worker-signal", "use_for": "pre_entry_validation_gate"},
+            )
+            record_handoff(
+                engine,
+                state,
+                key=f"handoff:validation:{symbol}:{int(cycle_started.timestamp() // max(CFG.validation_worker_seconds, 1))}",
+                stage="validation",
+                symbol=symbol,
+                status=status,
+                input_ref=f"klines:{symbol}:{CFG.strategy_interval}:{CFG.validation_backtest_bars}",
+                output_ref=f"latest_validation:{symbol}",
+                next_owner="worker-signal",
+                reason=reason,
+                metadata={"store_paths": CFG.validation_store_paths, "history_days": CFG.validation_history_days},
+            )
+        except Exception as exc:
+            statuses[symbol] = "ERROR"
+            record_handoff(
+                engine,
+                state,
+                key=f"handoff:validation-error:{symbol}:{int(time.time() // 60)}",
+                stage="validation",
+                symbol=symbol,
+                status="ERROR",
+                input_ref=f"klines:{symbol}:{CFG.strategy_interval}",
+                output_ref="none",
+                next_owner="worker-marketdata",
+                reason=f"Validation failed: {exc}",
+                metadata={},
+            )
+    heartbeat(engine, state, "worker-validation", detail={"statuses": statuses, "interval_seconds": CFG.validation_worker_seconds})
+    return statuses
+
+
+def run_validation_once() -> int:
+    state, engine = RedisState(CFG), db_engine(CFG)
+    init_schema(engine)
+    statuses = run_validation_cycle(state, engine, use_locks=False)
+    print(json.dumps({"generated_at": iso_now(), "statuses": statuses}, indent=2, default=str))
+    return 0 if statuses and all(status != "ERROR" for status in statuses.values()) else 1
+
+
+def run_validation() -> None:
+    state, engine = RedisState(CFG), db_engine(CFG)
+    init_schema(engine)
+    while True:
+        cycle_started = now_utc()
+        run_validation_cycle(state, engine, use_locks=True)
+        elapsed = (now_utc() - cycle_started).total_seconds()
+        time.sleep(max(30, CFG.validation_worker_seconds - elapsed))
 
 
 def run_marketdata() -> None:
@@ -1391,6 +1707,13 @@ def run_signal() -> None:
             ml_confidence, ml_version = predict_with_model(model, features) if CFG.ml_enabled else (1.0, "disabled")
             signal["ml_confidence"] = ml_confidence
             signal["ml_model_version"] = ml_version
+            validation_state = latest_validation_snapshot(state, engine, symbol, fallback=False)
+            validation_status = str(validation_state.get("validation_status", "AMBER"))
+            signal["validation_status"] = validation_status
+            if candidate_side := signal.get("candidate_side", "HOLD"):
+                if candidate_side in {"BUY", "SELL"} and validation_status != "GREEN":
+                    signal["deployable"] = False
+                    signal.setdefault("deployment_blockers", []).append(f"validation_not_green:{validation_status}")
             drift_blockers = feature_drift_blockers(drift_training, model, features)
             if drift_blockers:
                 signal["deployable"] = False
@@ -1427,12 +1750,53 @@ def run_signal() -> None:
                 {**signal, "ts": now_utc().replace(tzinfo=None)},
             )
             candidate_side = signal.get("candidate_side", "HOLD")
+            signal_code = "SIG_BUY" if candidate_side == "BUY" else "SIG_SELL" if candidate_side == "SELL" else "SIG_HOLD"
+            journal_write(
+                engine,
+                state,
+                key=f"journal:{key}:{signal_code}",
+                code=signal_code,
+                actor="worker-signal",
+                symbol=symbol,
+                side=candidate_side,
+                signal_key=key,
+                model_version=ml_version,
+                confidence=float(ml_confidence),
+                expected_reversion_bps=float(signal.get("expected_reversion_bps", 0.0) or 0.0),
+                features=features,
+                context={
+                    "price": signal.get("price"),
+                    "deployable": bool(signal.get("deployable")),
+                    "blockers": signal.get("deployment_blockers", []),
+                    "rationale": signal.get("rationale", ""),
+                    "suggested_usdt": signal.get("suggested_usdt", 0.0),
+                },
+                lesson={"use_for": "entry_confidence_feedback", "label_source": "trade_outcomes"},
+            )
+            if candidate_side in {"BUY", "SELL"} and signal.get("deployment_blockers"):
+                journal_write(
+                    engine,
+                    state,
+                    key=f"journal:{key}:SIG_BLOCKED",
+                    code="SIG_BLOCKED",
+                    actor="worker-signal",
+                    symbol=symbol,
+                    side=candidate_side,
+                    signal_key=key,
+                    model_version=ml_version,
+                    confidence=float(ml_confidence),
+                    expected_reversion_bps=float(signal.get("expected_reversion_bps", 0.0) or 0.0),
+                    features=features,
+                    context={"blockers": signal.get("deployment_blockers", []), "rationale": signal.get("rationale", "")},
+                    lesson={"action": "do_not_train_as_execution_failure", "reason": "pre_trade_gate_block"},
+                )
             if (
                 CFG.system_stage == "training"
                 and CFG.training_auto_approve_paper
                 and CFG.auto_approve_order_mode in {"PAPER", "TESTNET"}
                 and candidate_side in {"BUY", "SELL"}
                 and (not CFG.deploy_symbol_whitelist or symbol in CFG.deploy_symbol_whitelist)
+                and (not CFG.training_auto_requires_validation or signal.get("validation_status") == "GREEN")
                 and not any(str(item).startswith("ml_feature_drift:") for item in signal.get("deployment_blockers", []))
                 and ml_confidence >= CFG.training_auto_approve_min_ml_confidence
                 and float(signal.get("spread_bps", 999.0)) <= 10
@@ -1466,6 +1830,22 @@ def run_signal() -> None:
                         "payload": json.dumps(auto_payload),
                         "ts": now_utc().replace(tzinfo=None),
                     },
+                )
+                journal_write(
+                    engine,
+                    state,
+                    key=f"journal:{auto_key}:AUTO_APPROVED",
+                    code="AUTO_APPROVED",
+                    actor="worker-signal-training-auto",
+                    symbol=symbol,
+                    side=candidate_side,
+                    signal_key=key,
+                    model_version=ml_version,
+                    confidence=float(ml_confidence),
+                    expected_reversion_bps=float(signal.get("expected_reversion_bps", 0.0) or 0.0),
+                    features=features,
+                    context={"mode": auto_mode, "requested_size_usdt": auto_payload["suggested_usdt"], "price": signal["price"]},
+                    lesson={"goal": "collect_outcome_feedback"},
                 )
         heartbeat(engine, state, "worker-signal")
         time.sleep(8)
@@ -1611,7 +1991,7 @@ def order_request_is_allowed(request_payload: dict[str, Any], risk_state: dict[s
         return False, "Training auto-approval ML confidence is below threshold."
     if CFG.ml_confidence_gate_enabled and float(request_payload.get("ml_confidence", 0.0)) < CFG.min_ml_confidence and not training_auto:
         return False, "ML confidence is below deployment threshold."
-    if request_payload.get("validation_status") != "GREEN" and not training_auto:
+    if request_payload.get("validation_status") != "GREEN" and (not training_auto or cfg.training_auto_requires_validation):
         return False, "Validation state is not green."
     if float(request_payload.get("confidence", 0.0)) < 0.45:
         return False, "Signal confidence is below deployment threshold."
@@ -1667,6 +2047,22 @@ def process_deployment_request(engine: Engine, state: RedisState, request_row: A
                 text("INSERT INTO audit_log(event_type, actor, symbol, message, metadata_json, ts) VALUES('ORDER_BLOCKED', 'worker-order', :symbol, :message, :meta, :ts)"),
                 {"symbol": request_row.symbol, "message": reason, "meta": json.dumps(request_payload), "ts": ts},
             )
+        journal_write(
+            engine,
+            state,
+            key=f"journal:{request_key}:ORDER_BLOCKED",
+            code="ORDER_BLOCKED",
+            actor="worker-order",
+            symbol=str(request_row.symbol),
+            side=str(request_row.side),
+            signal_key=str(request_row.signal_key or ""),
+            model_version=str(request_payload.get("ml_model_version", "")),
+            confidence=float(request_payload.get("ml_confidence", 0.0) or 0.0),
+            expected_reversion_bps=float(request_payload.get("expected_reversion_bps", 0.0) or 0.0),
+            features=signal_features(request_payload),
+            context={"reason": reason, "request_id": request_id, "mode": mode},
+            lesson={"action": "tighten_pre_order_gate" if "slippage" in reason.lower() or "spread" in reason.lower() else "review_gate_reason"},
+        )
         state.publish("risk_events", {"request_id": request_id, "symbol": request_row.symbol, "status": "BLOCKED", "reason": reason, "ts": iso_now()})
         return "BLOCKED"
 
@@ -1744,6 +2140,22 @@ def process_deployment_request(engine: Engine, state: RedisState, request_row: A
     position_payload = {"symbol": request_row.symbol, "side": request_row.side, "size_usdt": size_usdt, "quantity": quantity, "entry_price": price, "mode": mode, "ts": iso_now()}
     state.set_json(f"live_position:{request_row.symbol}", position_payload, ex=3600)
     state.publish_audit({"event_type": "ORDER_EXECUTED", **position_payload})
+    journal_write(
+        engine,
+        state,
+        key=f"journal:{request_key}:ORDER_EXECUTED",
+        code="ORDER_EXECUTED",
+        actor="worker-order",
+        symbol=str(request_row.symbol),
+        side=str(request_row.side),
+        signal_key=str(request_row.signal_key or ""),
+        model_version=str(request_payload.get("ml_model_version", "")),
+        confidence=float(request_payload.get("ml_confidence", 0.0) or 0.0),
+        expected_reversion_bps=float(request_payload.get("expected_reversion_bps", 0.0) or 0.0),
+        features=signal_features(request_payload),
+        context={"request_id": request_id, "order_key": order_key, "mode": mode, "size_usdt": size_usdt, "entry_price": price},
+        lesson={"watch": "actual_return_vs_expected_reversion"},
+    )
     return "EXECUTED"
 
 
@@ -1824,6 +2236,26 @@ def run_ml() -> None:
                              AND actual_outcome IS NULL""",
                         {"key": key, "label": int(row["label"]), "ret": float(row["forward_return"]), "evaluated_at": now_utc().replace(tzinfo=None)},
                     )
+                    journal_write(
+                        engine,
+                        state,
+                        key=f"journal:{key}:{'OUTCOME_WIN' if int(row['label']) else 'OUTCOME_LOSS'}",
+                        code="OUTCOME_WIN" if int(row["label"]) else "OUTCOME_LOSS",
+                        actor="worker-ml",
+                        symbol=symbol,
+                        side=str(row["side"]),
+                        signal_key=key,
+                        actual_outcome=int(row["label"]),
+                        actual_return=float(row["forward_return"]),
+                        expected_reversion_bps=float(row.get("expected_reversion_bps", 0.0) or 0.0),
+                        features=features,
+                        context={"horizon_bars": CFG.mean_reversion_hold_bars, "max_favorable_bps": float(row["max_favorable_bps"]), "max_adverse_bps": float(row["max_adverse_bps"])},
+                        lesson={
+                            "train_label": int(row["label"]),
+                            "return_bps": float(row["forward_return"]) * 10000,
+                            "feedback_use": "entry_confidence_training",
+                        },
+                    )
             historical_training = load_labeled_training_from_db(engine)
             combined = pieces + ([historical_training] if not historical_training.empty else [])
             training = dedupe_training_frame(pd.concat(combined, ignore_index=True)) if combined else pd.DataFrame()
@@ -1889,8 +2321,207 @@ def audit_rows(engine: Engine | None) -> pd.DataFrame:
         return pd.DataFrame()
 
 
+def journal_rows(engine: Engine | None, limit: int = 60) -> pd.DataFrame:
+    if engine is None:
+        return pd.DataFrame([{"created_at": iso_now(), "journal_code": "LOCAL_PREVIEW", "type": "SYSTEM", "severity": "INFO", "actor": "system", "symbol": "", "side": "", "confidence": 0.0, "expected_bps": 0.0, "actual_outcome": "", "actual_return_bps": "", "summary": "MariaDB unavailable; journal preview only."}])
+    rows = db_rows(
+        engine,
+        f"""SELECT created_at, journal_code, journal_type, severity, actor, symbol, side, model_version,
+                  confidence, expected_reversion_bps, actual_outcome, actual_return, context_json, lesson_json
+           FROM trading_journal ORDER BY id DESC LIMIT {int(limit)}""",
+    )
+    parsed = []
+    for row in rows:
+        context = safe_json_dict(row.get("context_json"))
+        lesson = safe_json_dict(row.get("lesson_json"))
+        parsed.append(
+            {
+                "created_at": row.get("created_at"),
+                "journal_code": row.get("journal_code"),
+                "type": row.get("journal_type"),
+                "severity": row.get("severity"),
+                "actor": row.get("actor"),
+                "symbol": row.get("symbol"),
+                "side": row.get("side"),
+                "confidence": float(row.get("confidence") or 0.0),
+                "expected_bps": float(row.get("expected_reversion_bps") or 0.0),
+                "actual_outcome": "" if row.get("actual_outcome") is None else int(row.get("actual_outcome")),
+                "actual_return_bps": "" if row.get("actual_return") is None else f"{float(row.get('actual_return')) * 10000:.1f}",
+                "summary": context.get("meaning") or context.get("reason") or lesson.get("feedback_use") or "",
+            }
+        )
+    return pd.DataFrame(parsed)
+
+
+def journal_feedback_summary(engine: Engine | None) -> pd.DataFrame:
+    rows = db_rows(
+        engine,
+        """SELECT journal_code, journal_type, COUNT(*) events,
+                  AVG(confidence) avg_confidence,
+                  AVG(actual_outcome) win_rate,
+                  AVG(actual_return) avg_return
+           FROM trading_journal
+           WHERE created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 7 DAY)
+           GROUP BY journal_code, journal_type
+           ORDER BY events DESC""",
+    )
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return pd.DataFrame(columns=["journal_code", "journal_type", "events", "avg_confidence", "win_rate", "avg_return_bps"])
+    frame["avg_confidence"] = frame["avg_confidence"].fillna(0).astype(float).map(lambda value: f"{value:.2f}")
+    frame["win_rate"] = frame["win_rate"].fillna(0).astype(float).map(lambda value: f"{value:.1%}")
+    frame["avg_return_bps"] = frame["avg_return"].fillna(0).astype(float).map(lambda value: f"{value * 10000:.1f}")
+    return frame.drop(columns=["avg_return"])
+
+
+def journal_export_rows(engine: Engine | None, limit: int = 1000) -> pd.DataFrame:
+    if engine is None:
+        return journal_rows(engine)
+    rows = db_rows(
+        engine,
+        f"""SELECT created_at, journal_code, journal_type, severity, actor, symbol, side, signal_key, model_version,
+                  confidence, expected_reversion_bps, actual_outcome, actual_return, feature_json, context_json, lesson_json
+           FROM trading_journal ORDER BY id DESC LIMIT {int(limit)}""",
+    )
+    export = []
+    for row in rows:
+        features = safe_json_dict(row.get("feature_json"))
+        context = safe_json_dict(row.get("context_json"))
+        lesson = safe_json_dict(row.get("lesson_json"))
+        export.append(
+            {
+                "created_at": row.get("created_at"),
+                "journal_code": row.get("journal_code"),
+                "journal_type": row.get("journal_type"),
+                "severity": row.get("severity"),
+                "actor": row.get("actor"),
+                "symbol": row.get("symbol"),
+                "side": row.get("side"),
+                "signal_key": row.get("signal_key"),
+                "model_version": row.get("model_version"),
+                "confidence": float(row.get("confidence") or 0.0),
+                "expected_reversion_bps": float(row.get("expected_reversion_bps") or 0.0),
+                "actual_outcome": row.get("actual_outcome"),
+                "actual_return_bps": "" if row.get("actual_return") is None else float(row.get("actual_return")) * 10000,
+                "reason": context.get("reason") or context.get("meaning") or context.get("rationale") or "",
+                "blockers": ", ".join(str(item) for item in context.get("blockers", [])) if isinstance(context.get("blockers"), list) else str(context.get("blockers", "")),
+                "lesson": lesson.get("feedback_use") or lesson.get("action") or lesson.get("goal") or lesson.get("watch") or lesson.get("promotion_reason") or "",
+                "suggested_change": journal_suggested_change(str(row.get("journal_code", "")), context, lesson),
+                "z_abs": features.get("z_abs", ""),
+                "z_signed": features.get("z_signed", ""),
+                "rsi_distance": features.get("rsi_distance", ""),
+                "volume_z": features.get("volume_z", ""),
+                "adx": features.get("adx", ""),
+                "expected_feature_bps": features.get("expected_reversion_bps", ""),
+                "obi": features.get("obi", ""),
+                "spread_bps": features.get("spread_bps", ""),
+                "model_slippage_bps": features.get("model_slippage_bps", ""),
+                "funding_pressure": features.get("funding_pressure", ""),
+                "open_interest_signal": features.get("open_interest_signal", ""),
+                "context_json": json.dumps(context),
+                "lesson_json": json.dumps(lesson),
+            }
+        )
+    return pd.DataFrame(export)
+
+
+def journal_suggested_change(code: str, context: dict[str, Any], lesson: dict[str, Any]) -> str:
+    blockers = context.get("blockers", [])
+    blockers_text = " ".join(str(item) for item in blockers) if isinstance(blockers, list) else str(blockers)
+    if code == "SIG_BLOCKED" and "ml_confidence" in blockers_text:
+        return "Review confidence threshold or improve labels for similar setups."
+    if code == "SIG_BLOCKED" and "ml_feature_drift" in blockers_text:
+        return "Do not deploy; retrain or normalize drifted feature before allowing this setup."
+    if code == "ORDER_BLOCKED":
+        return "Move repeated final-gate failures earlier into signal/risk filters."
+    if code == "OUTCOME_LOSS":
+        return "Compare feature values with winners and reduce weight/size for this setup bucket."
+    if code == "OUTCOME_WIN":
+        return "Candidate pattern worth preserving; check if feature bucket has repeatable edge."
+    if code == "MODEL_REJECTED":
+        return "Use rejection reason to improve labeling, features, or class balance before promotion."
+    if code in {"SIG_BUY", "SIG_SELL"}:
+        return "Track subsequent outcome; use as evidence only after feedback label arrives."
+    return lesson.get("action") or lesson.get("feedback_use") or ""
+
+
+def journal_excel_bytes(frame: pd.DataFrame) -> bytes:
+    html = (
+        "<html><head><meta charset='utf-8'></head><body>"
+        "<h2>Horizon Trading Journal Export</h2>"
+        + frame.to_html(index=False, escape=True)
+        + "</body></html>"
+    )
+    return html.encode("utf-8")
+
+
+def journal_event_mix_chart(engine: Engine | None) -> go.Figure:
+    rows = db_rows(
+        engine,
+        """SELECT journal_type, COUNT(*) events
+           FROM trading_journal
+           WHERE created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 7 DAY)
+           GROUP BY journal_type ORDER BY events DESC""",
+    )
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        frame = pd.DataFrame({"journal_type": ["SIGNAL", "FEEDBACK", "MODEL"], "events": [0, 0, 0]})
+    fig = go.Figure(go.Bar(x=frame["journal_type"], y=frame["events"], marker_color=["#38bdf8", "#22c55e", "#facc15", "#fb7185"][: len(frame)]))
+    fig.update_yaxes(title="Events")
+    return dark_figure(fig, height=230)
+
+
+def journal_feedback_outcome_chart(engine: Engine | None) -> go.Figure:
+    rows = db_rows(
+        engine,
+        """SELECT journal_code, COUNT(*) events, AVG(actual_return) avg_return
+           FROM trading_journal
+           WHERE journal_type='FEEDBACK'
+             AND created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 30 DAY)
+           GROUP BY journal_code ORDER BY journal_code""",
+    )
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        frame = pd.DataFrame({"journal_code": ["OUTCOME_WIN", "OUTCOME_LOSS"], "events": [0, 0], "avg_return": [0.0, 0.0]})
+    colors = ["#22c55e" if code == "OUTCOME_WIN" else "#ef4444" for code in frame["journal_code"]]
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=frame["journal_code"], y=frame["events"], name="Events", marker_color=colors))
+    fig.add_trace(go.Scatter(x=frame["journal_code"], y=frame["avg_return"].astype(float) * 10000, name="Avg return bps", mode="lines+markers", yaxis="y2", line=dict(color="#facc15", width=2)))
+    fig.update_layout(yaxis2=dict(overlaying="y", side="right", title="Avg bps", gridcolor="rgba(0,0,0,0)"))
+    return dark_figure(fig, height=230)
+
+
+def journal_timeline_chart(engine: Engine | None) -> go.Figure:
+    rows = db_rows(
+        engine,
+        """SELECT DATE(created_at) day, journal_type, COUNT(*) events
+           FROM trading_journal
+           WHERE created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 14 DAY)
+           GROUP BY DATE(created_at), journal_type
+           ORDER BY day ASC""",
+    )
+    frame = pd.DataFrame(rows)
+    fig = go.Figure()
+    if frame.empty:
+        days = pd.date_range(end=now_utc().date(), periods=7)
+        frame = pd.DataFrame({"day": days, "journal_type": ["SIGNAL"] * len(days), "events": [0] * len(days)})
+    for journal_type, part in frame.groupby("journal_type"):
+        fig.add_trace(go.Scatter(x=part["day"], y=part["events"], mode="lines+markers", name=str(journal_type)))
+    return dark_figure(fig, height=240)
+
+
+def journal_reason_chart(engine: Engine | None) -> go.Figure:
+    frame = journal_export_rows(engine, 500)
+    if frame.empty or "suggested_change" not in frame.columns:
+        frame = pd.DataFrame({"suggested_change": ["Waiting for journal entries"], "events": [0]})
+    else:
+        frame = frame.groupby("suggested_change", dropna=False).size().reset_index(name="events").sort_values("events", ascending=True).tail(8)
+    fig = go.Figure(go.Bar(x=frame["events"], y=frame["suggested_change"], orientation="h", marker_color="#a78bfa"))
+    return dark_figure(fig, height=280)
+
+
 def worker_status_rows(state: RedisState) -> pd.DataFrame:
-    workers = ["worker-marketdata", "worker-signal", "worker-risk", "worker-ml", "worker-order", "worker-pnl"]
+    workers = ["worker-marketdata", "worker-validation", "worker-signal", "worker-risk", "worker-ml", "worker-order", "worker-pnl"]
     rows = []
     for worker in workers:
         payload = state.get_json(f"worker_status:{worker}") or {}
@@ -1940,7 +2571,7 @@ def performance_report(state: RedisState, engine: Engine | None) -> dict[str, An
     risk = state.get_json("risk_state") or {}
     drift = state.get_json("drift_state") or {}
     workers = []
-    for worker in ["worker-marketdata", "worker-signal", "worker-risk", "worker-ml", "worker-order", "worker-pnl"]:
+    for worker in ["worker-marketdata", "worker-validation", "worker-signal", "worker-risk", "worker-ml", "worker-order", "worker-pnl"]:
         payload = state.get_json(f"worker_status:{worker}") or {}
         workers.append({"worker": worker, "status": payload.get("status", "OFFLINE"), "last_seen": payload.get("last_seen", ""), "detail": payload.get("detail", {})})
     if engine is not None and all(row["status"] == "OFFLINE" for row in workers):
@@ -1963,8 +2594,13 @@ def performance_report(state: RedisState, engine: Engine | None) -> dict[str, An
     )
     recent_backtest = db_rows(
         engine,
-        """SELECT symbol, total_trades, win_rate, profit_factor, expectancy, max_drawdown, sharpe_like, ts
-           FROM backtest_runs ORDER BY id DESC LIMIT 5""",
+        """SELECT symbol, total_trades, win_rate, profit_factor, expectancy, max_drawdown, updated_at AS ts
+           FROM validation_state ORDER BY updated_at DESC LIMIT 10""",
+    )
+    recent_handoffs = db_rows(
+        engine,
+        """SELECT created_at, stage, symbol, status, next_owner, reason
+           FROM handoff_events ORDER BY id DESC LIMIT 12""",
     )
     positions = db_rows(
         engine,
@@ -1976,6 +2612,11 @@ def performance_report(state: RedisState, engine: Engine | None) -> dict[str, An
         "pending": int(db_scalar(engine, "SELECT COUNT(*) FROM deployment_requests WHERE status='PENDING'", default=0) or 0),
         "executed": int(db_scalar(engine, "SELECT COUNT(*) FROM deployment_requests WHERE status='EXECUTED'", default=0) or 0),
         "blocked": int(db_scalar(engine, "SELECT COUNT(*) FROM deployment_requests WHERE status='BLOCKED'", default=0) or 0),
+    }
+    journal_counts = {
+        "total_7d": int(db_scalar(engine, "SELECT COUNT(*) FROM trading_journal WHERE created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 7 DAY)", default=0) or 0),
+        "buy_signals_7d": int(db_scalar(engine, "SELECT COUNT(*) FROM trading_journal WHERE journal_code='SIG_BUY' AND created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 7 DAY)", default=0) or 0),
+        "feedback_7d": int(db_scalar(engine, "SELECT COUNT(*) FROM trading_journal WHERE journal_type='FEEDBACK' AND created_at >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 7 DAY)", default=0) or 0),
     }
     open_positions = int(db_scalar(engine, "SELECT COUNT(*) FROM positions WHERE status='OPEN'", default=0) or 0)
     active_model_payload = active_model[0] if active_model else {}
@@ -2001,11 +2642,13 @@ def performance_report(state: RedisState, engine: Engine | None) -> dict[str, An
         "drift": drift,
         "workers": workers,
         "orders": order_counts,
+        "journal": journal_counts,
         "open_positions": open_positions,
         "active_model": active_model_payload,
         "latest_signals": latest_signals,
         "recent_orders": recent_orders,
         "recent_backtests": recent_backtest,
+        "recent_handoffs": recent_handoffs,
         "positions": positions,
     }
 
@@ -2023,6 +2666,7 @@ def print_performance_report(report: dict[str, Any], as_json: bool = False) -> N
     print(f"Equity: ${pnl['equity']:,.2f} | Daily P&L: ${pnl['daily']:,.2f} | Realized: ${pnl['realized']:,.2f} | Unrealized: ${pnl['unrealized']:,.2f} | DD: {pnl['drawdown_pct']:.2f}%")
     print(f"Risk: {report.get('risk', {}).get('status', 'UNKNOWN')} | Drift: {report.get('drift', {}).get('status', 'UNKNOWN')} score={float(report.get('drift', {}).get('drift_score', 0) or 0):.1f}")
     print(f"Orders: pending={report['orders']['pending']} executed={report['orders']['executed']} blocked={report['orders']['blocked']} | Open positions={report['open_positions']}")
+    print(f"Journal: events_7d={report.get('journal', {}).get('total_7d', 0)} buy_signals_7d={report.get('journal', {}).get('buy_signals_7d', 0)} feedback_7d={report.get('journal', {}).get('feedback_7d', 0)}")
     model = report.get("active_model") or {}
     if model:
         metrics = model.get("metrics", {})
@@ -2031,6 +2675,16 @@ def print_performance_report(report: dict[str, Any], as_json: bool = False) -> N
     print("Workers")
     for row in report["workers"]:
         print(f"  {row.get('worker'):<18} {row.get('status', 'UNKNOWN'):<10} {row.get('last_seen', '')}")
+    print("")
+    print("Validation")
+    for row in report.get("recent_backtests", [])[:6]:
+        expectancy_bps = float(row.get("expectancy", 0) or 0) * 10000
+        max_dd_pct = abs(float(row.get("max_drawdown", 0) or 0)) * 100
+        print(f"  {row.get('symbol',''):<8} trades={int(row.get('total_trades', 0) or 0):<4} pf={format_profit_factor(row.get('profit_factor')):<9} exp={expectancy_bps:.1f}bps dd={max_dd_pct:.1f}% ts={row.get('ts','')}")
+    print("")
+    print("Recent handoffs")
+    for row in report.get("recent_handoffs", [])[:6]:
+        print(f"  {row.get('stage',''):<12} {row.get('symbol',''):<8} {row.get('status',''):<6} -> {row.get('next_owner',''):<18} {row.get('reason','')}")
     print("")
     print("Latest signals")
     for row in report["latest_signals"][:6]:
@@ -2813,9 +3467,7 @@ def render_ui() -> None:
     init_schema(engine)
     rows = demo_rows(state)
     selected = st.session_state.get("selected_symbol", CFG.symbols[0])
-    validation = validation_snapshot(selected, allow_live_fetch=False)
-    if state.ok and state.lock(f"lock:validation_persist:{selected}:{int(time.time() // 300)}", ttl=300):
-        persist_validation_snapshot(engine, validation)
+    validation = latest_validation_snapshot(state, engine, selected, fallback=True)
     backtest = validation["backtest"]
     walk = validation["walk_forward"]
     monte = validation["monte_carlo"]
@@ -2921,7 +3573,7 @@ def render_ui() -> None:
         )
         page = st.radio(
             "View",
-            ["Overview", "System Health", "Signals", "Performance", "Model Learning", "Trades", "Risk Monitor", "Funding & PnL", "Scanners", "Alerts", "Reports", "Settings", "Home"],
+            ["Overview", "System Health", "Signals", "Performance", "Model Learning", "Journal", "Trades", "Risk Monitor", "Funding & PnL", "Scanners", "Alerts", "Reports", "Settings", "Home"],
             index=0,
         )
         st.markdown(
@@ -3150,6 +3802,41 @@ def render_ui() -> None:
             render_detail_table(st, "Features Used By Entry Confidence Model", model_feature_rows())
         render_detail_table(st, "Model Registry History", model_history_rows(engine))
 
+    elif page == "Journal":
+        st.subheader("Journal and Auto Feedback")
+        st.markdown("Structured entries explain what the system saw, why it acted or blocked, and what later outcomes taught the model.")
+        journal = report.get("journal", {})
+        export_frame = journal_export_rows(engine)
+        jc = st.columns(3)
+        jc[0].markdown(ui_card("Journal Events", str(journal.get("total_7d", 0)), "Last 7 days", "GREEN" if int(journal.get("total_7d", 0) or 0) > 0 else "AMBER"), unsafe_allow_html=True)
+        jc[1].markdown(ui_card("Buy Signals", str(journal.get("buy_signals_7d", 0)), "Auto SIG_BUY entries", "GREEN" if int(journal.get("buy_signals_7d", 0) or 0) > 0 else "AMBER"), unsafe_allow_html=True)
+        jc[2].markdown(ui_card("Outcome Feedback", str(journal.get("feedback_7d", 0)), "Win/loss feedback labels", "GREEN" if int(journal.get("feedback_7d", 0) or 0) > 0 else "AMBER"), unsafe_allow_html=True)
+        st.download_button(
+            "Download Journal for Excel",
+            data=journal_excel_bytes(export_frame),
+            file_name=f"horizon_trading_journal_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xls",
+            mime="application/vnd.ms-excel",
+        )
+        j1, j2, j3 = st.columns([1, 1, 1.15])
+        with j1:
+            st.markdown("<div class='sb-panel-title'>What Is Being Journaled</div>", unsafe_allow_html=True)
+            st.plotly_chart(journal_event_mix_chart(engine), width="stretch")
+        with j2:
+            st.markdown("<div class='sb-panel-title'>Feedback Outcome Mix</div>", unsafe_allow_html=True)
+            st.plotly_chart(journal_feedback_outcome_chart(engine), width="stretch")
+        with j3:
+            st.markdown("<div class='sb-panel-title'>Improvement Themes</div>", unsafe_allow_html=True)
+            st.plotly_chart(journal_reason_chart(engine), width="stretch")
+        st.markdown("<div class='sb-panel-title'>Journal Activity Over Time</div>", unsafe_allow_html=True)
+        st.plotly_chart(journal_timeline_chart(engine), width="stretch")
+        left, right = st.columns([1.25, 1])
+        with left:
+            render_detail_table(st, "Recent Journal Entries", journal_rows(engine))
+            render_detail_table(st, "Excel Export Preview", export_frame.head(30))
+        with right:
+            render_detail_table(st, "Auto Feedback Summary", journal_feedback_summary(engine))
+            render_detail_table(st, "Journal Code Glossary", journal_code_rows())
+
     elif page == "Trades":
         st.subheader("Trades and Deployment")
         selected = st.selectbox("Replay Symbol", CFG.symbols, key="selected_symbol_trades")
@@ -3231,7 +3918,7 @@ def render_ui() -> None:
 
 
 def main() -> None:
-    cli_modes = {"ui", "marketdata", "signal", "risk", "order", "ml", "pnl", "report", "migrate-db"}
+    cli_modes = {"ui", "marketdata", "validation", "validation-once", "signal", "risk", "order", "ml", "pnl", "report", "migrate-db"}
     mode = sys.argv[1].strip().lower() if len(sys.argv) > 1 and sys.argv[1].strip().lower() in cli_modes else CFG.run_mode
     if mode == "ui":
         if "streamlit" not in sys.modules:
@@ -3239,6 +3926,10 @@ def main() -> None:
         render_ui()
     elif mode == "marketdata":
         run_marketdata()
+    elif mode == "validation":
+        run_validation()
+    elif mode == "validation-once":
+        raise SystemExit(run_validation_once())
     elif mode == "signal":
         run_signal()
     elif mode == "risk":

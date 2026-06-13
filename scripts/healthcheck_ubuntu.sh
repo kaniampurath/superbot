@@ -30,7 +30,7 @@ check "compose config" "docker compose -f $COMPOSE_FILE --env-file .env config"
 check "python compile in image" "docker compose -f $COMPOSE_FILE --env-file .env run --rm --no-deps worker-signal python -m py_compile horizon_institutional_live_production_grade.py"
 check "mariadb service" "docker compose -f $COMPOSE_FILE --env-file .env ps mariadb"
 check "redis service" "docker compose -f $COMPOSE_FILE --env-file .env ps redis"
-check "backend services" "docker compose -f $COMPOSE_FILE --env-file .env ps worker-marketdata worker-signal worker-risk worker-ml worker-order worker-pnl"
+check "backend services" "docker compose -f $COMPOSE_FILE --env-file .env ps worker-marketdata worker-validation worker-signal worker-risk worker-ml worker-order worker-pnl"
 
 if curl -fsS --max-time 3 "http://127.0.0.1:${UI_HOST_PORT}/_stcore/health" >/tmp/horizon_ui_health.out 2>/tmp/horizon_ui_health.err; then
   printf "%-32s OK\n" "ui health"

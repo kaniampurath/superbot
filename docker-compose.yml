@@ -65,6 +65,18 @@ services:
       redis:
         condition: service_healthy
 
+  worker-validation:
+    build: .
+    restart: unless-stopped
+    env_file: .env.example
+    environment:
+      RUN_MODE: validation
+    depends_on:
+      mariadb:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
   worker-risk:
     build: .
     restart: unless-stopped
