@@ -66,6 +66,25 @@ def iso_now() -> str:
     return now_utc().isoformat()
 
 
+def utc_naive_timestamp(value: Any) -> pd.Timestamp:
+    timestamp = pd.Timestamp(value)
+    if timestamp.tzinfo is not None:
+        timestamp = timestamp.tz_convert("UTC").tz_localize(None)
+    return timestamp
+
+
+def format_profit_factor(value: Any) -> str:
+    try:
+        profit_factor = float(value)
+    except (TypeError, ValueError):
+        return "Need data"
+    if math.isinf(profit_factor):
+        return "No losses"
+    if math.isnan(profit_factor):
+        return "Need data"
+    return f"{profit_factor:.2f}"
+
+
 @dataclass(frozen=True)
 class Config:
     run_mode: str = env_str("RUN_MODE", "ui")
@@ -346,7 +365,7 @@ def fetch_binance_klines(symbol: str, interval: str, limit: int = 180) -> pd.Dat
         frame = pd.DataFrame(rows, columns=columns)
         for column in ["open", "high", "low", "close", "volume", "quote_volume", "taker_buy_base", "taker_buy_quote"]:
             frame[column] = frame[column].astype(float)
-        frame["time"] = pd.to_datetime(frame["open_time"], unit="ms", utc=True)
+        frame["time"] = pd.to_datetime(frame["open_time"], unit="ms", utc=True).dt.tz_convert(None)
         return frame[["time", "open", "high", "low", "close", "volume", "quote_volume", "taker_buy_base", "taker_buy_quote"]]
     except Exception:
         return None
@@ -644,7 +663,7 @@ def synthetic_ohlcv(symbol: str, bars: int = 360) -> pd.DataFrame:
     taker_buy_quote = quote_volume * rng.uniform(0.42, 0.58, bars)
     return pd.DataFrame(
         {
-            "time": pd.date_range(end=pd.Timestamp.utcnow(), periods=bars, freq="min"),
+            "time": pd.date_range(end=utc_naive_timestamp(pd.Timestamp.now(tz=UTC)), periods=bars, freq="min"),
             "open": open_,
             "high": high,
             "low": low,
@@ -1010,7 +1029,7 @@ def load_labeled_training_from_db(engine: Engine | None) -> pd.DataFrame:
                     "forward_return": float(row["forward_return"]),
                     "max_favorable_bps": float(row["max_favorable_bps"] or 0.0),
                     "max_adverse_bps": float(row["max_adverse_bps"] or 0.0),
-                    "time": pd.Timestamp(row["ts"]),
+                    "time": utc_naive_timestamp(row["ts"]),
                 }
             )
             records.append(record)
@@ -1633,6 +1652,7 @@ def run_ml() -> None:
     init_schema(engine)
     while True:
         try:
+            heartbeat(engine, state, "worker-ml", status="ONLINE", detail={"phase": "training"})
             pieces = []
             for symbol in CFG.symbols:
                 frame = fetch_binance_klines(symbol, CFG.strategy_interval, limit=CFG.ml_training_bars)
@@ -1643,6 +1663,7 @@ def run_ml() -> None:
                 if candidates.empty:
                     continue
                 pieces.append(candidates)
+                heartbeat(engine, state, "worker-ml", status="ONLINE", detail={"phase": "training", "symbol": symbol, "candidate_rows": int(len(candidates))})
                 for _, row in candidates.tail(250).iterrows():
                     features = {name: float(row[name]) for name in ML_FEATURES}
                     key = f"mltrain:{symbol}:{pd.Timestamp(row['time']).isoformat()}:{row['side']}"
@@ -1681,7 +1702,12 @@ def run_ml() -> None:
                 heartbeat(engine, state, "worker-ml", status="DEGRADED", detail={"reason": "insufficient_labeled_training_rows", "rows": int(len(training))})
         except Exception as exc:
             heartbeat(engine, state, "worker-ml", status="ERROR", detail={"error": str(exc)[:240]})
-        time.sleep(CFG.ml_retrain_seconds)
+        slept = 0
+        while slept < CFG.ml_retrain_seconds:
+            nap = min(30, CFG.ml_retrain_seconds - slept)
+            time.sleep(nap)
+            slept += nap
+            heartbeat(engine, state, "worker-ml", status="ONLINE", detail={"phase": "waiting", "next_train_seconds": max(CFG.ml_retrain_seconds - slept, 0)})
 
 
 def color_badge(label: str, status: str, tip: str) -> str:
@@ -1737,7 +1763,7 @@ def worker_status_rows(state: RedisState) -> pd.DataFrame:
             {
                 "worker": worker,
                 "status": payload.get("status", "OFFLINE"),
-                "pid": payload.get("pid", ""),
+                "pid": str(payload.get("pid", "")),
                 "last_seen": payload.get("last_seen", ""),
             }
         )
@@ -1879,6 +1905,7 @@ def print_performance_report(report: dict[str, Any], as_json: bool = False) -> N
 def production_progress_chart(state: RedisState, rows: list[dict[str, Any]], validation: dict[str, Any], risk: dict[str, Any], drift: dict[str, Any]) -> go.Figure:
     backtest = validation["backtest"]
     profit_factor = float(backtest.get("profit_factor", 0.0))
+    profit_factor_label = format_profit_factor(profit_factor)
     expectancy_bps = float(backtest.get("expectancy", 0.0)) * 10000
     max_dd_pct = abs(float(backtest.get("max_drawdown", 0.0))) * 100
     ml_confidence = max((float(row.get("ml_confidence", 0.0)) for row in rows), default=0.0)
@@ -1901,7 +1928,7 @@ def production_progress_chart(state: RedisState, rows: list[dict[str, Any]], val
     ]
     categories = ["PF", "Expectancy", "Drawdown", "ML Confidence", "Workers", "Risk/Drift", "Deploy Ready"]
     details = [
-        f"PF {profit_factor:.2f} / {CFG.min_validation_profit_factor:.2f}",
+        f"PF {profit_factor_label} / {CFG.min_validation_profit_factor:.2f}",
         f"{expectancy_bps:.1f} bps / {CFG.min_validation_expectancy_bps:.1f} bps",
         f"{max_dd_pct:.1f}% <= {CFG.max_validation_drawdown_pct:.1f}%",
         f"{ml_confidence:.2f} / {CFG.min_ml_confidence:.2f}",
@@ -2095,7 +2122,7 @@ def model_learning_chart(engine: Engine | None, rows: list[dict[str, Any]]) -> g
     history = model_history_rows(engine)
     fig = go.Figure()
     if history.empty:
-        now = pd.Timestamp.utcnow()
+        now = utc_naive_timestamp(pd.Timestamp.now(tz=UTC))
         confidence = max((float(row.get("ml_confidence", 0.0)) for row in rows), default=0.0)
         history = pd.DataFrame(
             {
@@ -2124,7 +2151,7 @@ def training_growth_chart(engine: Engine | None) -> go.Figure:
     feature_df = pd.DataFrame(feature_rows).sort_values("day") if feature_rows else pd.DataFrame(columns=["day", "rows_count"])
     outcome_df = pd.DataFrame(outcome_rows).sort_values("day") if outcome_rows else pd.DataFrame(columns=["day", "rows_count"])
     if feature_df.empty and outcome_df.empty:
-        days = pd.date_range(end=pd.Timestamp.utcnow().date(), periods=7)
+        days = pd.date_range(end=now_utc().date(), periods=7)
         feature_df = pd.DataFrame({"day": days, "rows_count": [0] * len(days)})
         outcome_df = pd.DataFrame({"day": days, "rows_count": [0] * len(days)})
     fig = go.Figure()
@@ -2138,7 +2165,7 @@ def pnl_learning_chart(engine: Engine | None, pnl: dict[str, Any]) -> go.Figure:
     rows = db_rows(engine, "SELECT ts, equity, daily_pnl, current_dd_pct FROM pnl_snapshots ORDER BY ts ASC LIMIT 120")
     frame = pd.DataFrame(rows)
     if frame.empty:
-        now = pd.Timestamp.utcnow()
+        now = utc_naive_timestamp(pd.Timestamp.now(tz=UTC))
         frame = pd.DataFrame({"ts": [now - pd.Timedelta(hours=1), now], "equity": [CFG.starting_equity, float(pnl.get("equity", CFG.starting_equity) or CFG.starting_equity)], "current_dd_pct": [0, float(pnl.get("current_dd_pct", 0) or 0)]})
     fig = go.Figure()
     fig.add_trace(go.Scatter(x=frame["ts"], y=frame["equity"], mode="lines", name="Equity", line=dict(color="#22c55e", width=2), fill="tozeroy", fillcolor="rgba(34,197,94,.18)"))
@@ -2505,7 +2532,7 @@ def render_ui() -> None:
             <div class='sb-small'>Trading Performance</div>
             <div class='sb-health-row'><div></div><div>Backtest Trades</div><b>{validation_trades}</b></div>
             <div class='sb-health-row'><div></div><div>Expected Profit / Trade</div><b>{backtest['expectancy'] * 10000:.1f} bps</b></div>
-            <div class='sb-health-row'><div></div><div>Profit Factor</div><b>{backtest['profit_factor']:.2f}</b></div>
+            <div class='sb-health-row'><div></div><div>Profit Factor</div><b>{format_profit_factor(backtest.get('profit_factor'))}</b></div>
             <div class='sb-small' style='margin-top:10px'>Model Metrics</div>
             <div class='sb-health-row'><div></div><div>Model Confidence</div><b>{model_conf:.2f}</b></div>
             <div class='sb-health-row'><div></div><div>Training Rows</div><b>{model.get('trained_rows', 0) if model else 0}</b></div>
@@ -2563,7 +2590,7 @@ def render_ui() -> None:
             [
                 ("Backtest Trades", str(validation_trades)),
                 ("Win Rate", "Need data" if validation_trades < 10 else f"{backtest['win_rate']:.2%}"),
-                ("Profit Factor", f"{backtest['profit_factor']:.2f}"),
+                ("Profit Factor", format_profit_factor(backtest.get("profit_factor"))),
                 ("Expectancy", f"{backtest['expectancy'] * 10000:.1f} bps"),
                 ("Max Drawdown", f"{abs(backtest['max_drawdown']) * 100:.2f}%"),
             ],
