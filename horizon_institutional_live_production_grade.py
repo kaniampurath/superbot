@@ -2247,16 +2247,14 @@ def scanner_radar_html(rows: list[dict[str, Any]]) -> str:
         side = html_lib.escape(str(row.get("candidate_side", row.get("side", "HOLD"))))
         reason = html_lib.escape(scanner_reason(row))
         cards.append(
-            f"""
-            <div class="scan-tile">
-              <div class="scan-top"><b>{symbol}</b><span style="color:{color};border-color:{color}66;background:{color}1f">{status}</span></div>
-              <div class="scan-price">${float(row.get('price', 0) or 0):,.4f}</div>
-              <div class="scan-meta"><span>Bias: {side}</span><span>ML {float(row.get('ml_confidence', 0) or 0):.2f}</span></div>
-              <div class="scan-bar"><div style="width:{progress}%;background:{color}"></div></div>
-              <div class="scan-meta"><span>{progress}% scanned</span><span>Next: {html_lib.escape(next_phase)}</span></div>
-              <div class="scan-reason">{reason}</div>
-            </div>
-            """
+            f"<div class='scan-tile'>"
+            f"<div class='scan-top'><b>{symbol}</b><span style='color:{color};border-color:{color}66;background:{color}1f'>{status}</span></div>"
+            f"<div class='scan-price'>${float(row.get('price', 0) or 0):,.4f}</div>"
+            f"<div class='scan-meta'><span>Bias: {side}</span><span>ML {float(row.get('ml_confidence', 0) or 0):.2f}</span></div>"
+            f"<div class='scan-bar'><div style='width:{progress}%;background:{color}'></div></div>"
+            f"<div class='scan-meta'><span>{progress}% scanned</span><span>Next: {html_lib.escape(next_phase)}</span></div>"
+            f"<div class='scan-reason'>{reason}</div>"
+            f"</div>"
         )
     return f"<div class='scan-grid'>{''.join(cards)}</div>"
 
@@ -2308,19 +2306,17 @@ def render_scanner_command_center(st: Any, rows: list[dict[str, Any]], compact: 
     avg_progress = int(round(np.mean([scanner_progress(row)[0] for row in rows]))) if rows else 0
     best_row = max(rows, key=lambda row: abs(float(row.get("composite_score", 0) or 0))) if rows else {}
     st.markdown(
-        f"""
-        <div class="sb-panel">
-          <div class="sb-panel-title">Active Scanner</div>
-          <div class="scan-pulse-row">
-            <div><span class="scan-pulse"></span><b>Scanning {scanned} symbols</b><div class="sb-small">Price -> momentum -> volume -> order book -> model -> risk</div></div>
-            <div class="scan-summary"><b>{avg_progress}%</b><span>coverage</span></div>
-            <div class="scan-summary"><b>{candidates}</b><span>candidates</span></div>
-            <div class="scan-summary"><b>{deployable}</b><span>deployable</span></div>
-            <div class="scan-summary"><b>{html_lib.escape(str(best_row.get('symbol', '-')))}</b><span>strongest watch</span></div>
-          </div>
-          {scanner_radar_html(rows)}
-        </div>
-        """,
+        "<div class='sb-panel'>"
+        "<div class='sb-panel-title'>Active Scanner</div>"
+        "<div class='scan-pulse-row'>"
+        f"<div><span class='scan-pulse'></span><b>Scanning {scanned} symbols</b><div class='sb-small'>Price -> momentum -> volume -> order book -> model -> risk</div></div>"
+        f"<div class='scan-summary'><b>{avg_progress}%</b><span>coverage</span></div>"
+        f"<div class='scan-summary'><b>{candidates}</b><span>candidates</span></div>"
+        f"<div class='scan-summary'><b>{deployable}</b><span>deployable</span></div>"
+        f"<div class='scan-summary'><b>{html_lib.escape(str(best_row.get('symbol', '-')))}</b><span>strongest watch</span></div>"
+        "</div>"
+        f"{scanner_radar_html(rows)}"
+        "</div>",
         unsafe_allow_html=True,
     )
     if not compact:
