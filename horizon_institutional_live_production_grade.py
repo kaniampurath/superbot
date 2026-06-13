@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import html as html_lib
 import hmac
 import math
 import os
@@ -2156,6 +2157,153 @@ def signal_funnel_chart(report: dict[str, Any], rows: list[dict[str, Any]]) -> g
     return dark_figure(fig, height=230)
 
 
+def scanner_progress(row: dict[str, Any]) -> tuple[int, str, str]:
+    checks = [
+        ("Price", float(row.get("price", 0) or 0) > 0),
+        ("Momentum", abs(float(row.get("z_score", 0) or 0)) >= 0.8 or float(row.get("rsi", 50) or 50) <= 35 or float(row.get("rsi", 50) or 50) >= 65),
+        ("Participation", float(row.get("volume_z", 0) or 0) >= CFG.mean_reversion_min_volume_z),
+        ("Order Book", abs(float(row.get("obi", 0) or 0)) <= 0.45 and abs(float(row.get("cross_exchange_spread_bps", 0) or 0)) <= 15),
+        ("Model", float(row.get("ml_confidence", 0) or 0) >= CFG.min_ml_confidence or row.get("ml_model_version") in {"not_scored", "heuristic-fallback"}),
+        ("Risk", bool(row.get("deployable")) or row.get("side") == "HOLD"),
+    ]
+    passed = sum(1 for _, ok in checks if ok)
+    progress = int(round(passed / len(checks) * 100))
+    next_phase = next((name for name, ok in checks if not ok), "Ready")
+    blockers = row.get("deployment_blockers") or []
+    if bool(row.get("deployable")):
+        status = "Candidate"
+    elif row.get("candidate_side") != "HOLD" and blockers:
+        status = "Blocked"
+    elif progress >= 80:
+        status = "Watching"
+    else:
+        status = "Scanning"
+    return progress, next_phase, status
+
+
+def scanner_status_color(status: str) -> str:
+    return {
+        "Candidate": "#22c55e",
+        "Watching": "#38bdf8",
+        "Scanning": "#facc15",
+        "Blocked": "#ef4444",
+    }.get(status, "#94a3b8")
+
+
+def scanner_reason(row: dict[str, Any]) -> str:
+    blockers = row.get("deployment_blockers") or []
+    if bool(row.get("deployable")):
+        return "Passed signal, cost, liquidity, model, and risk screens."
+    if blockers:
+        friendly = {
+            "research_only": "research-only mode",
+            "symbol_not_whitelisted": "symbol not approved for deployment",
+            "buy_rsi_not_oversold": "RSI not oversold enough",
+            "sell_rsi_not_overbought": "RSI not overbought enough",
+            "low_participation": "volume participation is low",
+            "trend_regime_adx_high": "trend is too strong for mean reversion",
+            "expected_move_below_cost_hurdle": "expected move is below fees/slippage",
+            "spread_too_wide": "spread is too wide",
+            "slippage_too_high": "estimated slippage is too high",
+            "confidence_too_low": "confidence is below gate",
+        }
+        return "; ".join(friendly.get(str(item), str(item).replace("_", " ")) for item in blockers[:3])
+    return "No trade: signal edge is not strong enough yet."
+
+
+def scanner_radar_html(rows: list[dict[str, Any]]) -> str:
+    cards = []
+    for row in rows:
+        progress, next_phase, status = scanner_progress(row)
+        color = scanner_status_color(status)
+        symbol = html_lib.escape(str(row.get("symbol", "")))
+        side = html_lib.escape(str(row.get("candidate_side", row.get("side", "HOLD"))))
+        reason = html_lib.escape(scanner_reason(row))
+        cards.append(
+            f"""
+            <div class="scan-tile">
+              <div class="scan-top"><b>{symbol}</b><span style="color:{color};border-color:{color}66;background:{color}1f">{status}</span></div>
+              <div class="scan-price">${float(row.get('price', 0) or 0):,.4f}</div>
+              <div class="scan-meta"><span>Bias: {side}</span><span>ML {float(row.get('ml_confidence', 0) or 0):.2f}</span></div>
+              <div class="scan-bar"><div style="width:{progress}%;background:{color}"></div></div>
+              <div class="scan-meta"><span>{progress}% scanned</span><span>Next: {html_lib.escape(next_phase)}</span></div>
+              <div class="scan-reason">{reason}</div>
+            </div>
+            """
+        )
+    return f"<div class='scan-grid'>{''.join(cards)}</div>"
+
+
+def scanner_timeline_rows(rows: list[dict[str, Any]]) -> pd.DataFrame:
+    timeline = []
+    now = datetime.now().strftime("%H:%M:%S")
+    for row in sorted(rows, key=lambda item: abs(float(item.get("composite_score", 0) or 0)), reverse=True):
+        progress, next_phase, status = scanner_progress(row)
+        timeline.append(
+            {
+                "Time": now,
+                "Symbol": row.get("symbol", ""),
+                "Phase": next_phase,
+                "Status": status,
+                "Progress": f"{progress}%",
+                "Signal": row.get("candidate_side", row.get("side", "HOLD")),
+                "Confidence": f"{float(row.get('ml_confidence', 0) or 0):.2f}",
+                "Reason": scanner_reason(row),
+            }
+        )
+    return pd.DataFrame(timeline)
+
+
+def scanner_strength_chart(rows: list[dict[str, Any]]) -> go.Figure:
+    frame = pd.DataFrame(
+        [
+            {
+                "symbol": row.get("symbol", ""),
+                "opportunity": min(100, abs(float(row.get("composite_score", 0) or 0)) * 100),
+                "progress": scanner_progress(row)[0],
+                "confidence": float(row.get("ml_confidence", 0) or 0) * 100,
+            }
+            for row in rows
+        ]
+    )
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=frame["symbol"], y=frame["progress"], name="Scan Progress", marker_color="#38bdf8"))
+    fig.add_trace(go.Scatter(x=frame["symbol"], y=frame["opportunity"], mode="lines+markers", name="Opportunity", line=dict(color="#facc15", width=2)))
+    fig.add_trace(go.Scatter(x=frame["symbol"], y=frame["confidence"], mode="lines+markers", name="ML Confidence", line=dict(color="#22c55e", width=2)))
+    fig.update_yaxes(range=[0, 105], ticksuffix="%")
+    return dark_figure(fig, height=250)
+
+
+def render_scanner_command_center(st: Any, rows: list[dict[str, Any]], compact: bool = False) -> None:
+    scanned = len(rows)
+    candidates = sum(1 for row in rows if row.get("candidate_side") != "HOLD")
+    deployable = sum(1 for row in rows if row.get("deployable"))
+    avg_progress = int(round(np.mean([scanner_progress(row)[0] for row in rows]))) if rows else 0
+    best_row = max(rows, key=lambda row: abs(float(row.get("composite_score", 0) or 0))) if rows else {}
+    st.markdown(
+        f"""
+        <div class="sb-panel">
+          <div class="sb-panel-title">Active Scanner</div>
+          <div class="scan-pulse-row">
+            <div><span class="scan-pulse"></span><b>Scanning {scanned} symbols</b><div class="sb-small">Price -> momentum -> volume -> order book -> model -> risk</div></div>
+            <div class="scan-summary"><b>{avg_progress}%</b><span>coverage</span></div>
+            <div class="scan-summary"><b>{candidates}</b><span>candidates</span></div>
+            <div class="scan-summary"><b>{deployable}</b><span>deployable</span></div>
+            <div class="scan-summary"><b>{html_lib.escape(str(best_row.get('symbol', '-')))}</b><span>strongest watch</span></div>
+          </div>
+          {scanner_radar_html(rows)}
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+    if not compact:
+        chart_col, table_col = st.columns([1.05, 1.25])
+        with chart_col:
+            st.plotly_chart(scanner_strength_chart(rows), width="stretch")
+        with table_col:
+            render_detail_table(st, "Scanner Timeline", scanner_timeline_rows(rows))
+
+
 def render_detail_table(st: Any, title: str, frame: pd.DataFrame) -> None:
     st.markdown(f"<div class='sb-panel-title'>{title}</div>", unsafe_allow_html=True)
     st.dataframe(frame, width="stretch", hide_index=True)
@@ -2243,6 +2391,22 @@ def render_ui() -> None:
         th,td{font-size:12px!important}
         .stButton button{border-radius:8px;border:1px solid #2b4c7e;background:#12356a;color:#eff6ff}
         .stButton button:hover{border-color:#60a5fa;color:white}
+        .scan-pulse-row{display:grid;grid-template-columns:1.8fr repeat(4,.72fr);gap:10px;align-items:center;margin-bottom:12px}
+        .scan-pulse{display:inline-block;width:11px;height:11px;border-radius:50%;background:#22c55e;margin-right:8px;box-shadow:0 0 0 0 rgba(34,197,94,.8);animation:scanPulse 1.5s infinite}
+        @keyframes scanPulse{0%{box-shadow:0 0 0 0 rgba(34,197,94,.8)}70%{box-shadow:0 0 0 12px rgba(34,197,94,0)}100%{box-shadow:0 0 0 0 rgba(34,197,94,0)}}
+        .scan-summary{border:1px solid #263750;border-radius:8px;background:rgba(15,23,42,.55);padding:9px 10px;text-align:center}
+        .scan-summary b{display:block;color:#f8fafc;font-size:1.15rem}
+        .scan-summary span{display:block;color:#94a3b8;font-size:.72rem}
+        .scan-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}
+        .scan-tile{border:1px solid #263750;border-radius:8px;background:linear-gradient(180deg,rgba(15,31,53,.92),rgba(10,21,36,.92));padding:12px;min-height:150px}
+        .scan-top{display:flex;justify-content:space-between;align-items:center;gap:8px}
+        .scan-top span{border:1px solid;border-radius:6px;padding:2px 7px;font-size:.72rem;font-weight:800}
+        .scan-price{font-size:1.35rem;font-weight:800;color:#f8fafc;margin-top:8px}
+        .scan-meta{display:flex;justify-content:space-between;gap:8px;color:#b6c6dc;font-size:.76rem;margin-top:6px}
+        .scan-bar{height:7px;background:#111827;border-radius:999px;margin-top:10px;overflow:hidden;border:1px solid #263750}
+        .scan-bar div{height:100%;border-radius:999px}
+        .scan-reason{color:#94a3b8;font-size:.75rem;line-height:1.25;margin-top:9px;min-height:34px}
+        @media (max-width:1100px){.scan-pulse-row{grid-template-columns:1fr 1fr}.scan-summary{text-align:left}}
         </style>
         """,
         unsafe_allow_html=True,
@@ -2314,6 +2478,8 @@ def render_ui() -> None:
         ]
         for col, spec in zip(card_cols, card_specs):
             col.markdown(ui_card(*spec), unsafe_allow_html=True)
+
+        render_scanner_command_center(st, rows, compact=True)
 
         left, mid, right = st.columns([1.05, 1.35, .72])
         with left:
@@ -2473,6 +2639,7 @@ def render_ui() -> None:
 
     elif page == "Scanners":
         st.subheader("Scanners")
+        render_scanner_command_center(st, rows, compact=False)
         render_detail_table(st, "Market Scanner", df[scanner_cols])
 
     elif page == "Alerts":
