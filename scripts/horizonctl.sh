@@ -70,7 +70,8 @@ case "$ACTION" in
   migrate-db)
     if docker_ready; then
       compose up -d mariadb redis
-      compose run --rm worker-signal python horizon_institutional_live_production_grade.py migrate-db
+      compose build worker-signal
+      compose run --rm --no-deps worker-signal python horizon_institutional_live_production_grade.py migrate-db
     else
       python horizon_institutional_live_production_grade.py migrate-db
     fi

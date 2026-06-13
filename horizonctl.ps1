@@ -139,7 +139,8 @@ switch ($Action) {
     "migrate-db" {
         if (Invoke-NativeOk { docker info }) {
             docker compose up -d mariadb redis
-            docker compose run --rm worker-signal python horizon_institutional_live_production_grade.py migrate-db
+            docker compose build worker-signal
+            docker compose run --rm --no-deps worker-signal python horizon_institutional_live_production_grade.py migrate-db
         } else {
             python horizon_institutional_live_production_grade.py migrate-db
         }
