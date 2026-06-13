@@ -67,11 +67,19 @@ case "$ACTION" in
       python scripts/performance_report.py --env-file "$ENV_FILE" --json
     fi
     ;;
+  migrate-db)
+    if docker_ready; then
+      compose up -d mariadb redis
+      compose run --rm worker-signal python horizon_institutional_live_production_grade.py migrate-db
+    else
+      python horizon_institutional_live_production_grade.py migrate-db
+    fi
+    ;;
   stop)
     compose --profile ui down
     ;;
   *)
-    echo "Usage: scripts/horizonctl.sh {start-backend|start-ui|health|status|logs|db|redis|troubleshoot|performance|performance-json|stop}"
+    echo "Usage: scripts/horizonctl.sh {start-backend|start-ui|health|status|logs|db|redis|troubleshoot|performance|performance-json|migrate-db|stop}"
     exit 2
     ;;
 esac

@@ -111,6 +111,12 @@ Release artifacts:
 | `systemd/horizon-backend.service` | Headless backend service |
 | `systemd/horizon-ui.service` | Optional dashboard service |
 
+Run database updates after pulling releases that add or change tables:
+
+```bash
+bash scripts/horizonctl.sh migrate-db
+```
+
 ## Prompt Utility
 Use `horizonctl` from PowerShell or Command Prompt.
 
@@ -122,6 +128,7 @@ PowerShell:
 .\horizonctl.ps1 start-ui
 .\horizonctl.ps1 performance
 .\horizonctl.ps1 performance-json
+.\horizonctl.ps1 migrate-db
 .\horizonctl.ps1 status
 .\horizonctl.ps1 stop
 ```

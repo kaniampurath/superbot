@@ -304,6 +304,15 @@ def init_schema(engine: Engine | None) -> None:
         conn.execute(text("INSERT IGNORE INTO strategies(name, status, created_at) VALUES ('institutional_mispricing_v1', 'ACTIVE', :ts)"), {"ts": now_utc().replace(tzinfo=None)})
 
 
+def migrate_database(engine: Engine | None) -> int:
+    if engine is None:
+        print("Database unavailable; schema migration skipped.", file=sys.stderr)
+        return 1
+    init_schema(engine)
+    print(f"Database schema ready: {len(SCHEMA_SQL)} tables checked, {len(SCHEMA_MIGRATIONS)} migrations applied.")
+    return 0
+
+
 def db_execute(engine: Engine | None, statement: str, params: dict[str, Any]) -> None:
     if engine is None:
         return
@@ -828,6 +837,38 @@ ML_FEATURES = [
 ]
 
 
+ML_FEATURE_DESCRIPTIONS = {
+    "z_abs": "Absolute mean-reversion stretch.",
+    "z_signed": "Direction of price stretch versus basis.",
+    "rsi_distance": "How far RSI is beyond the buy/sell threshold.",
+    "volume_z": "Volume participation versus recent normal.",
+    "adx": "Trend strength; high values are bad for mean reversion.",
+    "expected_reversion_bps": "Estimated gross reversion opportunity in basis points.",
+    "taker_buy_ratio": "Aggressive buy flow share.",
+    "atr_pct": "Recent volatility as percent of price.",
+    "realized_vol_ratio": "Fast volatility versus slow volatility.",
+    "htf_trend": "Higher-timeframe trend context.",
+    "obi": "Order-book imbalance.",
+    "spread_bps": "Observed bid/ask or venue price gap.",
+    "model_slippage_bps": "Estimated execution slippage.",
+    "funding_pressure": "Funding/crowding pressure.",
+    "open_interest_signal": "Open-interest behavior signal.",
+}
+
+
+def dedupe_training_frame(training: pd.DataFrame) -> pd.DataFrame:
+    if training.empty:
+        return training
+    frame = training.copy()
+    if "idempotency_key" in frame.columns:
+        frame = frame.drop_duplicates(subset=["idempotency_key"], keep="last")
+    else:
+        subset = [col for col in ["symbol", "side", "time"] if col in frame.columns]
+        if subset:
+            frame = frame.drop_duplicates(subset=subset, keep="last")
+    return frame.sort_values("time").reset_index(drop=True) if "time" in frame.columns else frame.reset_index(drop=True)
+
+
 def signal_features(signal: dict[str, Any]) -> dict[str, float]:
     z_score = float(signal.get("z_score", 0.0))
     rsi = float(signal.get("rsi", 50.0))
@@ -1025,6 +1066,7 @@ def load_labeled_training_from_db(engine: Engine | None) -> pd.DataFrame:
                 {
                     "symbol": row["symbol"],
                     "side": row["side"],
+                    "idempotency_key": row["idempotency_key"],
                     "label": int(row["label"]),
                     "forward_return": float(row["forward_return"]),
                     "max_favorable_bps": float(row["max_favorable_bps"] or 0.0),
@@ -1047,6 +1089,25 @@ def latest_active_model(engine: Engine | None) -> dict[str, Any] | None:
         return json.loads(row.model_json) if row else None
     except Exception:
         return None
+
+
+def latest_model_candidate(engine: Engine | None) -> dict[str, Any]:
+    rows = db_rows(
+        engine,
+        """SELECT version, status, trained_rows, metrics_json, trained_at
+           FROM model_registry
+           WHERE model_name='mean_reversion_entry_confidence'
+           ORDER BY trained_at DESC LIMIT 1""",
+    )
+    if not rows:
+        return {}
+    row = rows[0]
+    metrics = {}
+    try:
+        metrics = json.loads(row.get("metrics_json") or "{}")
+    except Exception:
+        metrics = {}
+    return {**row, "metrics": metrics}
 
 
 def model_promotable(candidate: dict[str, Any], active: dict[str, Any] | None, cfg: Config) -> tuple[bool, str]:
@@ -1691,7 +1752,7 @@ def run_ml() -> None:
                     )
             historical_training = load_labeled_training_from_db(engine)
             combined = pieces + ([historical_training] if not historical_training.empty else [])
-            training = pd.concat(combined, ignore_index=True).sort_values("time") if combined else pd.DataFrame()
+            training = dedupe_training_frame(pd.concat(combined, ignore_index=True)) if combined else pd.DataFrame()
             model = train_logistic_model(training)
             if model:
                 active_model = latest_active_model(engine)
@@ -2113,9 +2174,17 @@ def model_history_rows(engine: Engine | None) -> pd.DataFrame:
                 "accuracy": float(metrics.get("accuracy", 0) or 0),
                 "precision": float(metrics.get("precision", 0) or 0),
                 "recall": float(metrics.get("recall", 0) or 0),
+                "positive_rate": float(metrics.get("positive_rate", 0) or 0),
+                "reason": metrics.get("promotion_reason", ""),
             }
         )
     return pd.DataFrame(parsed)
+
+
+def model_feature_rows() -> pd.DataFrame:
+    return pd.DataFrame(
+        [{"Feature": name, "Meaning": ML_FEATURE_DESCRIPTIONS.get(name, ""), "Used": "Yes"} for name in ML_FEATURES]
+    )
 
 
 def model_learning_chart(engine: Engine | None, rows: list[dict[str, Any]]) -> go.Figure:
@@ -2159,6 +2228,24 @@ def training_growth_chart(engine: Engine | None) -> go.Figure:
     fig.add_trace(go.Bar(x=outcome_df["day"], y=outcome_df["rows_count"], name="Labeled Outcomes", marker_color="#22c55e"))
     fig.update_layout(barmode="group")
     return dark_figure(fig, height=220)
+
+
+def training_coverage_rows(engine: Engine | None) -> pd.DataFrame:
+    rows = db_rows(
+        engine,
+        """SELECT DATE(ts) day, COUNT(*) labeled_outcomes, AVG(label) positive_rate,
+                  AVG(forward_return) avg_forward_return
+           FROM trade_outcomes
+           GROUP BY DATE(ts)
+           ORDER BY day DESC LIMIT 14""",
+    )
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        return pd.DataFrame(columns=["day", "labeled_outcomes", "positive_rate", "avg_forward_return"])
+    frame = frame.sort_values("day")
+    frame["positive_rate"] = frame["positive_rate"].astype(float).map(lambda value: f"{value:.1%}")
+    frame["avg_forward_return"] = frame["avg_forward_return"].astype(float).map(lambda value: f"{value * 10000:.1f} bps")
+    return frame
 
 
 def pnl_learning_chart(engine: Engine | None, pnl: dict[str, Any]) -> go.Figure:
@@ -2357,6 +2444,8 @@ def render_ui() -> None:
     total_workers = max(len(worker_frame), 1)
     model = report.get("active_model") or {}
     model_metrics = model.get("metrics", {}) if model else {}
+    latest_candidate = latest_model_candidate(engine)
+    latest_candidate_metrics = latest_candidate.get("metrics", {}) if latest_candidate else {}
     model_conf = max((float(row.get("ml_confidence", 0.0)) for row in rows), default=0.0)
     signals_now = sum(1 for r in rows if r.get("side") != "HOLD")
     deploy_ready = any(bool(row.get("deployable")) for row in rows) and risk.get("status") == "RISK_OK" and drift.get("status") != "DRIFT_LOCKED" and not CFG.mean_reversion_research_only
@@ -2598,16 +2687,35 @@ def render_ui() -> None:
     elif page == "Model Learning":
         st.subheader("Model Learning")
         st.markdown("This page shows whether the model is collecting data, retraining, and improving enough to trust its entry confidence.")
+        latest_rows = int(latest_candidate.get("trained_rows", 0) or 0) if latest_candidate else 0
+        latest_accuracy = float(latest_candidate_metrics.get("accuracy", 0) or 0)
+        latest_reason = str(latest_candidate_metrics.get("promotion_reason", "")) or "waiting_for_training"
         c1, c2, c3, c4 = st.columns(4)
         c1.markdown(ui_card("Active Version", model.get("version", "None"), "Model registry", "GREEN" if model else "AMBER"), unsafe_allow_html=True)
-        c2.markdown(ui_card("Training Rows", str(model.get("trained_rows", 0) if model else 0), "Rows used in latest model", "GREEN" if model else "AMBER"), unsafe_allow_html=True)
-        c3.markdown(ui_card("Accuracy", f"{float(model_metrics.get('accuracy', 0) or 0):.2%}", "Latest promoted model", "GREEN" if float(model_metrics.get("accuracy", 0) or 0) >= CFG.ml_min_accuracy else "AMBER"), unsafe_allow_html=True)
+        c2.markdown(ui_card("Latest Training Rows", str(latest_rows), f"Active rows {model.get('trained_rows', 0) if model else 0}", "GREEN" if latest_rows >= CFG.ml_min_training_rows else "AMBER"), unsafe_allow_html=True)
+        c3.markdown(ui_card("Latest Accuracy", f"{latest_accuracy:.2%}", f"Reason: {latest_reason}", "GREEN" if latest_accuracy >= CFG.ml_min_accuracy else "AMBER"), unsafe_allow_html=True)
         c4.markdown(ui_card("Confidence Gate", f"{model_conf:.2f}", f"Target {CFG.min_ml_confidence:.2f}", "GREEN" if model_conf >= CFG.min_ml_confidence else "AMBER"), unsafe_allow_html=True)
+        if latest_candidate:
+            st.markdown(
+                ui_panel(
+                    "Latest Candidate Decision",
+                    f"<div class='sb-health-row'><span class='sb-dot' style='background:{ui_status_color('GREEN' if latest_candidate.get('status') == 'ACTIVE' else 'AMBER')}'></span>"
+                    f"<div><div class='sb-health-title'>{html_lib.escape(str(latest_candidate.get('version', '')))}</div>"
+                    f"<div class='sb-health-sub'>Status {html_lib.escape(str(latest_candidate.get('status', '')))} | rows {latest_rows} | precision {float(latest_candidate_metrics.get('precision', 0) or 0):.2%} | recall {float(latest_candidate_metrics.get('recall', 0) or 0):.2%} | positive rate {float(latest_candidate_metrics.get('positive_rate', 0) or 0):.2%}</div></div>"
+                    f"<b>{html_lib.escape(latest_reason)}</b></div>",
+                ),
+                unsafe_allow_html=True,
+            )
         l1, l2 = st.columns(2)
         with l1:
             st.plotly_chart(model_learning_chart(engine, rows), width="stretch")
         with l2:
             st.plotly_chart(training_growth_chart(engine), width="stretch")
+        cov_left, cov_right = st.columns([1.05, 1])
+        with cov_left:
+            render_detail_table(st, "Daily Labeled Outcome Coverage", training_coverage_rows(engine))
+        with cov_right:
+            render_detail_table(st, "Features Used By Entry Confidence Model", model_feature_rows())
         render_detail_table(st, "Model Registry History", model_history_rows(engine))
 
     elif page == "Trades":
@@ -2691,7 +2799,7 @@ def render_ui() -> None:
 
 
 def main() -> None:
-    cli_modes = {"ui", "marketdata", "signal", "risk", "order", "ml", "pnl", "report"}
+    cli_modes = {"ui", "marketdata", "signal", "risk", "order", "ml", "pnl", "report", "migrate-db"}
     mode = sys.argv[1].strip().lower() if len(sys.argv) > 1 and sys.argv[1].strip().lower() in cli_modes else CFG.run_mode
     if mode == "ui":
         if "streamlit" not in sys.modules:
@@ -2712,6 +2820,8 @@ def main() -> None:
     elif mode == "report":
         state, engine = RedisState(CFG), db_engine(CFG)
         print_performance_report(performance_report(state, engine), as_json="--json" in sys.argv)
+    elif mode == "migrate-db":
+        raise SystemExit(migrate_database(db_engine(CFG)))
     else:
         raise SystemExit(f"Unknown RUN_MODE={CFG.run_mode}")
 

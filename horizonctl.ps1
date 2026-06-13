@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("start-backend", "start-ui", "local-ui", "health", "status", "performance", "performance-json", "stop")]
+    [ValidateSet("start-backend", "start-ui", "local-ui", "health", "status", "performance", "performance-json", "migrate-db", "stop")]
     [string]$Action = "health"
 )
 
@@ -134,6 +134,14 @@ switch ($Action) {
             docker compose run --rm --no-deps worker-signal python scripts/performance_report.py --env-file .env.example --json
         } else {
             python scripts/performance_report.py --env-file .env.example --json
+        }
+    }
+    "migrate-db" {
+        if (Invoke-NativeOk { docker info }) {
+            docker compose up -d mariadb redis
+            docker compose run --rm worker-signal python horizon_institutional_live_production_grade.py migrate-db
+        } else {
+            python horizon_institutional_live_production_grade.py migrate-db
         }
     }
     "stop" {
