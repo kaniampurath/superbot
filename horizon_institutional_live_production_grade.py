@@ -275,8 +275,8 @@ SCHEMA_SQL = [
     """CREATE TABLE IF NOT EXISTS monte_carlo_runs (id BIGINT PRIMARY KEY AUTO_INCREMENT, symbol VARCHAR(24), median_ending_equity DOUBLE, p5_ending_equity DOUBLE, p95_ending_equity DOUBLE, prob_dd_breach DOUBLE, prob_ruin DOUBLE, expected_max_dd DOUBLE, worst_path_json JSON, ts DATETIME(6))""",
     """CREATE TABLE IF NOT EXISTS feature_snapshots (id BIGINT PRIMARY KEY AUTO_INCREMENT, idempotency_key VARCHAR(180) UNIQUE, symbol VARCHAR(24), side VARCHAR(8), strategy_interval VARCHAR(16), feature_json JSON, source VARCHAR(40), ts DATETIME(6), KEY idx_feature_symbol_ts(symbol, ts))""",
     """CREATE TABLE IF NOT EXISTS trade_outcomes (id BIGINT PRIMARY KEY AUTO_INCREMENT, feature_id BIGINT NULL, idempotency_key VARCHAR(180) UNIQUE, symbol VARCHAR(24), side VARCHAR(8), label INT, forward_return DOUBLE, max_favorable_bps DOUBLE, max_adverse_bps DOUBLE, horizon_bars INT, outcome_json JSON, ts DATETIME(6))""",
-    """CREATE TABLE IF NOT EXISTS model_registry (id BIGINT PRIMARY KEY AUTO_INCREMENT, model_name VARCHAR(80), version VARCHAR(80), status VARCHAR(30), feature_list_json JSON, model_json JSON, metrics_json JSON, trained_rows INT, trained_at DATETIME(6), KEY idx_model_status(model_name, status, trained_at))""",
-    """CREATE TABLE IF NOT EXISTS ml_predictions (id BIGINT PRIMARY KEY AUTO_INCREMENT, idempotency_key VARCHAR(180) UNIQUE, symbol VARCHAR(24), side VARCHAR(8), model_version VARCHAR(80), confidence DOUBLE, threshold DOUBLE, feature_json JSON, created_at DATETIME(6), KEY idx_ml_symbol_created(symbol, created_at))""",
+    """CREATE TABLE IF NOT EXISTS model_registry (id BIGINT PRIMARY KEY AUTO_INCREMENT, model_name VARCHAR(80), version VARCHAR(80), status VARCHAR(30), feature_list_json JSON, feature_importance_json JSON, model_json JSON, metrics_json JSON, trained_rows INT, trained_at DATETIME(6), KEY idx_model_status(model_name, status, trained_at))""",
+    """CREATE TABLE IF NOT EXISTS ml_predictions (id BIGINT PRIMARY KEY AUTO_INCREMENT, idempotency_key VARCHAR(180) UNIQUE, symbol VARCHAR(24), side VARCHAR(8), model_version VARCHAR(80), confidence DOUBLE, threshold DOUBLE, feature_json JSON, actual_outcome INT NULL, actual_return DOUBLE NULL, training_date DATETIME(6) NULL, evaluated_at DATETIME(6) NULL, created_at DATETIME(6), KEY idx_ml_symbol_created(symbol, created_at))""",
     """CREATE TABLE IF NOT EXISTS drift_snapshots (id BIGINT PRIMARY KEY AUTO_INCREMENT, live_win_rate DOUBLE, backtest_win_rate DOUBLE, live_expectancy DOUBLE, backtest_expectancy DOUBLE, live_slippage_bps DOUBLE, modeled_slippage_bps DOUBLE, live_trade_frequency DOUBLE, expected_trade_frequency DOUBLE, live_drawdown DOUBLE, expected_drawdown DOUBLE, status VARCHAR(20), ts DATETIME(6))""",
     """CREATE TABLE IF NOT EXISTS risk_events (id BIGINT PRIMARY KEY AUTO_INCREMENT, event_type VARCHAR(80), severity VARCHAR(20), message TEXT, state_json JSON, ts DATETIME(6))""",
     """CREATE TABLE IF NOT EXISTS audit_log (id BIGINT PRIMARY KEY AUTO_INCREMENT, event_type VARCHAR(80), actor VARCHAR(80), symbol VARCHAR(24), message TEXT, metadata_json JSON, ts DATETIME(6))""",
@@ -290,6 +290,11 @@ SCHEMA_MIGRATIONS = [
     "ALTER TABLE signals ADD COLUMN IF NOT EXISTS expected_reversion_bps DOUBLE",
     "ALTER TABLE signals ADD COLUMN IF NOT EXISTS ml_confidence DOUBLE",
     "ALTER TABLE signals ADD COLUMN IF NOT EXISTS ml_model_version VARCHAR(80)",
+    "ALTER TABLE model_registry ADD COLUMN IF NOT EXISTS feature_importance_json JSON",
+    "ALTER TABLE ml_predictions ADD COLUMN IF NOT EXISTS actual_outcome INT NULL",
+    "ALTER TABLE ml_predictions ADD COLUMN IF NOT EXISTS actual_return DOUBLE NULL",
+    "ALTER TABLE ml_predictions ADD COLUMN IF NOT EXISTS training_date DATETIME(6) NULL",
+    "ALTER TABLE ml_predictions ADD COLUMN IF NOT EXISTS evaluated_at DATETIME(6) NULL",
 ]
 
 
@@ -1003,10 +1008,14 @@ def train_logistic_model(training: pd.DataFrame) -> dict[str, Any] | None:
     precision = float(((binary == 1) & positives).sum() / max((binary == 1).sum(), 1))
     recall = float(((binary == 1) & positives).sum() / max(positives.sum(), 1))
     version = f"mr-logistic-{int(time.time())}"
+    raw_importance = {name: abs(float(weight)) for name, weight in zip(ML_FEATURES, weights)}
+    total_importance = sum(raw_importance.values()) or 1.0
+    feature_importance = {name: value / total_importance for name, value in raw_importance.items()}
     return {
         "model_name": "mean_reversion_entry_confidence",
         "version": version,
         "features": ML_FEATURES,
+        "feature_importance": feature_importance,
         "mean": mean.tolist(),
         "std": std.tolist(),
         "weights": weights.tolist(),
@@ -1094,7 +1103,7 @@ def latest_active_model(engine: Engine | None) -> dict[str, Any] | None:
 def latest_model_candidate(engine: Engine | None) -> dict[str, Any]:
     rows = db_rows(
         engine,
-        """SELECT version, status, trained_rows, metrics_json, trained_at
+        """SELECT version, status, trained_rows, feature_importance_json, metrics_json, trained_at
            FROM model_registry
            WHERE model_name='mean_reversion_entry_confidence'
            ORDER BY trained_at DESC LIMIT 1""",
@@ -1107,7 +1116,12 @@ def latest_model_candidate(engine: Engine | None) -> dict[str, Any]:
         metrics = json.loads(row.get("metrics_json") or "{}")
     except Exception:
         metrics = {}
-    return {**row, "metrics": metrics}
+    importance = {}
+    try:
+        importance = json.loads(row.get("feature_importance_json") or "{}")
+    except Exception:
+        importance = {}
+    return {**row, "metrics": metrics, "feature_importance": importance}
 
 
 def model_promotable(candidate: dict[str, Any], active: dict[str, Any] | None, cfg: Config) -> tuple[bool, str]:
@@ -1130,6 +1144,8 @@ def model_promotable(candidate: dict[str, Any], active: dict[str, Any] | None, c
 
 
 def persist_model_candidate(engine: Engine | None, state: RedisState, model: dict[str, Any], status: str, reason: str) -> None:
+    trained_at = now_utc().replace(tzinfo=None)
+    model = {**model, "trained_at": trained_at.isoformat()}
     if engine is None:
         if status == "ACTIVE":
             state.set_json("ml_model:mean_reversion_entry_confidence", model, ex=CFG.ml_retrain_seconds)
@@ -1139,16 +1155,17 @@ def persist_model_candidate(engine: Engine | None, state: RedisState, model: dic
             conn.execute(text("UPDATE model_registry SET status='ARCHIVED' WHERE model_name='mean_reversion_entry_confidence' AND status='ACTIVE'"))
         metrics = {**model["metrics"], "promotion_reason": reason}
         conn.execute(
-            text("INSERT INTO model_registry(model_name, version, status, feature_list_json, model_json, metrics_json, trained_rows, trained_at) VALUES(:name, :version, :status, :features, :model, :metrics, :rows, :ts)"),
+            text("INSERT INTO model_registry(model_name, version, status, feature_list_json, feature_importance_json, model_json, metrics_json, trained_rows, trained_at) VALUES(:name, :version, :status, :features, :importance, :model, :metrics, :rows, :ts)"),
             {
                 "name": model["model_name"],
                 "version": model["version"],
                 "status": status,
                 "features": json.dumps(model["features"]),
+                "importance": json.dumps(model.get("feature_importance", {})),
                 "model": json.dumps(model),
                 "metrics": json.dumps(metrics),
                 "rows": int(model["metrics"]["rows"]),
-                "ts": now_utc().replace(tzinfo=None),
+                "ts": trained_at,
             },
         )
     if status == "ACTIVE":
@@ -1352,8 +1369,18 @@ def run_signal() -> None:
             )
             db_execute(
                 engine,
-                "INSERT IGNORE INTO ml_predictions(idempotency_key, symbol, side, model_version, confidence, threshold, feature_json, created_at) VALUES(:key, :symbol, :side, :version, :confidence, :threshold, :features, :ts)",
-                {"key": key, "symbol": symbol, "side": signal["side"], "version": ml_version, "confidence": ml_confidence, "threshold": CFG.min_ml_confidence, "features": json.dumps(features), "ts": now_utc().replace(tzinfo=None)},
+                "INSERT IGNORE INTO ml_predictions(idempotency_key, symbol, side, model_version, confidence, threshold, feature_json, training_date, created_at) VALUES(:key, :symbol, :side, :version, :confidence, :threshold, :features, :training_date, :ts)",
+                {
+                    "key": key,
+                    "symbol": symbol,
+                    "side": signal["side"],
+                    "version": ml_version,
+                    "confidence": ml_confidence,
+                    "threshold": CFG.min_ml_confidence,
+                    "features": json.dumps(features),
+                    "training_date": utc_naive_timestamp(pd.Timestamp(model.get("trained_at"))) if model and model.get("trained_at") else None,
+                    "ts": now_utc().replace(tzinfo=None),
+                },
             )
             db_execute(
                 engine,
@@ -1749,6 +1776,14 @@ def run_ml() -> None:
                             "outcome": json.dumps({"label_rule": "net_forward_return_gt_zero_after_costs"}),
                             "ts": ts,
                         },
+                    )
+                    db_execute(
+                        engine,
+                        """UPDATE ml_predictions
+                           SET actual_outcome=:label, actual_return=:ret, evaluated_at=:evaluated_at
+                           WHERE idempotency_key=:key
+                             AND actual_outcome IS NULL""",
+                        {"key": key, "label": int(row["label"]), "ret": float(row["forward_return"]), "evaluated_at": now_utc().replace(tzinfo=None)},
                     )
             historical_training = load_labeled_training_from_db(engine)
             combined = pieces + ([historical_training] if not historical_training.empty else [])
@@ -2248,6 +2283,195 @@ def training_coverage_rows(engine: Engine | None) -> pd.DataFrame:
     return frame
 
 
+def safe_json_dict(value: Any) -> dict[str, Any]:
+    if isinstance(value, dict):
+        return value
+    try:
+        parsed = json.loads(value or "{}")
+        return parsed if isinstance(parsed, dict) else {}
+    except Exception:
+        return {}
+
+
+def prediction_learning_frame(engine: Engine | None, limit: int = 1000) -> pd.DataFrame:
+    rows = db_rows(
+        engine,
+        f"""SELECT p.idempotency_key, p.symbol, p.side, p.model_version, p.confidence, p.threshold,
+                  p.feature_json, p.actual_outcome, p.actual_return, p.training_date,
+                  p.evaluated_at, p.created_at, o.label, o.forward_return
+           FROM ml_predictions p
+           LEFT JOIN trade_outcomes o ON o.idempotency_key = p.idempotency_key
+           ORDER BY p.created_at DESC LIMIT {int(limit)}""",
+    )
+    parsed = []
+    for row in rows:
+        features = safe_json_dict(row.get("feature_json"))
+        actual = row.get("actual_outcome")
+        if actual is None:
+            actual = row.get("label")
+        actual_return = row.get("actual_return")
+        if actual_return is None:
+            actual_return = row.get("forward_return")
+        record = {
+            "idempotency_key": row.get("idempotency_key"),
+            "symbol": row.get("symbol"),
+            "side": row.get("side"),
+            "model_version": row.get("model_version"),
+            "confidence": float(row.get("confidence") or 0.0),
+            "threshold": float(row.get("threshold") or CFG.min_ml_confidence),
+            "actual_outcome": None if actual is None else int(actual),
+            "actual_return": None if actual_return is None else float(actual_return),
+            "training_date": row.get("training_date"),
+            "evaluated_at": row.get("evaluated_at"),
+            "created_at": row.get("created_at"),
+        }
+        for feature in ML_FEATURES:
+            record[feature] = float(features.get(feature, 0.0) or 0.0)
+        parsed.append(record)
+    return pd.DataFrame(parsed)
+
+
+def feature_importance_chart(model: dict[str, Any], latest_candidate: dict[str, Any]) -> go.Figure:
+    importance = latest_candidate.get("feature_importance") or model.get("feature_importance") or {}
+    if not importance and model.get("weights"):
+        weights = [abs(float(value)) for value in model.get("weights", [])]
+        total = sum(weights) or 1.0
+        importance = {name: weight / total for name, weight in zip(model.get("features", ML_FEATURES), weights)}
+    frame = pd.DataFrame({"feature": ML_FEATURES, "importance": [float(importance.get(name, 0.0)) * 100 for name in ML_FEATURES]})
+    frame = frame.sort_values("importance", ascending=True).tail(10)
+    fig = go.Figure(go.Bar(x=frame["importance"], y=frame["feature"], orientation="h", marker_color="#38bdf8"))
+    fig.update_xaxes(ticksuffix="%")
+    return dark_figure(fig, height=280)
+
+
+def feature_drift_chart(engine: Engine | None, rows: list[dict[str, Any]]) -> go.Figure:
+    history = load_labeled_training_from_db(engine)
+    live = pd.DataFrame([{name: float(signal_features(row).get(name, 0.0)) for name in ML_FEATURES} for row in rows])
+    if history.empty or live.empty:
+        drift = pd.DataFrame({"feature": ML_FEATURES[:8], "drift": [0.0] * min(8, len(ML_FEATURES))})
+    else:
+        drift_rows = []
+        for feature in ML_FEATURES:
+            hist_std = float(history[feature].astype(float).std() or 1.0)
+            value = abs(float(live[feature].mean()) - float(history[feature].astype(float).mean())) / max(hist_std, 1e-9)
+            drift_rows.append({"feature": feature, "drift": min(value, 5.0)})
+        drift = pd.DataFrame(drift_rows).sort_values("drift", ascending=True).tail(10)
+    colors = ["#ef4444" if value >= 2 else "#facc15" if value >= 1 else "#22c55e" for value in drift["drift"]]
+    fig = go.Figure(go.Bar(x=drift["drift"], y=drift["feature"], orientation="h", marker_color=colors))
+    fig.add_vline(x=1, line_dash="dot", line_color="#facc15")
+    fig.add_vline(x=2, line_dash="dot", line_color="#ef4444")
+    return dark_figure(fig, height=280)
+
+
+def prediction_confidence_trend_chart(engine: Engine | None, rows: list[dict[str, Any]]) -> go.Figure:
+    frame = prediction_learning_frame(engine, 500)
+    if frame.empty:
+        now = utc_naive_timestamp(pd.Timestamp.now(tz=UTC))
+        confidence = max((float(row.get("ml_confidence", 0.0)) for row in rows), default=0.0)
+        frame = pd.DataFrame({"created_at": [now - pd.Timedelta(hours=1), now], "confidence": [confidence, confidence]})
+    frame["created_at"] = pd.to_datetime(frame["created_at"])
+    grouped = frame.sort_values("created_at").set_index("created_at")["confidence"].resample("1h").mean().dropna().reset_index()
+    fig = go.Figure(go.Scatter(x=grouped["created_at"], y=grouped["confidence"] * 100, mode="lines+markers", name="Avg confidence", line=dict(color="#facc15", width=2)))
+    fig.add_hline(y=CFG.min_ml_confidence * 100, line_dash="dot", line_color="#38bdf8")
+    fig.update_yaxes(range=[0, 105], ticksuffix="%")
+    return dark_figure(fig, height=250)
+
+
+def hit_rate_by_feature_bucket_chart(engine: Engine | None) -> go.Figure:
+    frame = prediction_learning_frame(engine, 1200)
+    frame = frame.dropna(subset=["actual_outcome"]) if not frame.empty else frame
+    features = ["z_abs", "expected_reversion_bps", "volume_z", "funding_pressure"]
+    fig = go.Figure()
+    if frame.empty:
+        for feature in features:
+            fig.add_trace(go.Bar(x=["Low", "Mid", "High"], y=[0, 0, 0], name=feature))
+    else:
+        for feature in features:
+            series = frame[feature].astype(float)
+            try:
+                buckets = pd.qcut(series.rank(method="first"), 3, labels=["Low", "Mid", "High"])
+            except Exception:
+                buckets = pd.Series(["Mid"] * len(frame))
+            hit_rate = frame.assign(bucket=buckets).groupby("bucket", observed=False)["actual_outcome"].mean().reindex(["Low", "Mid", "High"]).fillna(0) * 100
+            fig.add_trace(go.Bar(x=hit_rate.index, y=hit_rate.values, name=feature))
+    fig.update_yaxes(range=[0, 105], ticksuffix="%")
+    fig.update_layout(barmode="group")
+    return dark_figure(fig, height=280)
+
+
+def expected_vs_actual_reversion_chart(engine: Engine | None) -> go.Figure:
+    frame = prediction_learning_frame(engine, 1200)
+    frame = frame.dropna(subset=["actual_return"]) if not frame.empty else frame
+    if frame.empty:
+        frame = pd.DataFrame({"expected_reversion_bps": [0], "actual_bps": [0], "confidence": [0]})
+    else:
+        frame["actual_bps"] = frame["actual_return"].astype(float) * 10000
+    fig = go.Figure(go.Scatter(x=frame["expected_reversion_bps"], y=frame["actual_bps"], mode="markers", marker=dict(color=frame["confidence"] * 100, colorscale="Viridis", showscale=True, colorbar=dict(title="Conf %"))))
+    fig.add_hline(y=0, line_dash="dot", line_color="#94a3b8")
+    fig.update_xaxes(title="Expected reversion bps")
+    fig.update_yaxes(title="Actual forward return bps")
+    return dark_figure(fig, height=280)
+
+
+def slippage_vs_spread_chart(engine: Engine | None) -> go.Figure:
+    frame = prediction_learning_frame(engine, 1200)
+    if frame.empty:
+        frame = pd.DataFrame({"spread_bps": [0], "model_slippage_bps": [0], "confidence": [0]})
+    fig = go.Figure(go.Scatter(x=frame["spread_bps"], y=frame["model_slippage_bps"], mode="markers", marker=dict(color=frame["confidence"] * 100, colorscale="Turbo", showscale=True, colorbar=dict(title="Conf %"))))
+    fig.update_xaxes(title="Spread bps")
+    fig.update_yaxes(title="Modeled slippage bps")
+    return dark_figure(fig, height=250)
+
+
+def funding_oi_pressure_chart(engine: Engine | None, rows: list[dict[str, Any]]) -> go.Figure:
+    db_signal_rows = db_rows(engine, "SELECT ts, symbol, funding_pressure, open_interest_signal FROM signals ORDER BY ts DESC LIMIT 300")
+    frame = pd.DataFrame(db_signal_rows)
+    if frame.empty:
+        frame = pd.DataFrame([{"ts": iso_now(), "symbol": row.get("symbol"), "funding_pressure": row.get("funding_pressure", 0.0), "open_interest_signal": row.get("open_interest_signal", 0.0)} for row in rows])
+    frame["ts"] = pd.to_datetime(frame["ts"])
+    grouped = frame.sort_values("ts").set_index("ts")[["funding_pressure", "open_interest_signal"]].resample("15min").mean().dropna().reset_index()
+    if grouped.empty:
+        grouped = pd.DataFrame({"ts": [utc_naive_timestamp(pd.Timestamp.now(tz=UTC))], "funding_pressure": [0.0], "open_interest_signal": [0.0]})
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=grouped["ts"], y=grouped["funding_pressure"], mode="lines", name="Funding pressure", line=dict(color="#a78bfa", width=2)))
+    fig.add_trace(go.Scatter(x=grouped["ts"], y=grouped["open_interest_signal"], mode="lines", name="OI signal", line=dict(color="#38bdf8", width=2)))
+    fig.update_yaxes(range=[-1.05, 1.05])
+    return dark_figure(fig, height=250)
+
+
+def model_score_waterfall_chart(model: dict[str, Any], row: dict[str, Any]) -> go.Figure:
+    features = signal_features(row)
+    if model and model.get("weights"):
+        model_features = model.get("features", ML_FEATURES)
+        mean = np.array(model.get("mean", [0.0] * len(model_features)), dtype=float)
+        std = np.array(model.get("std", [1.0] * len(model_features)), dtype=float)
+        std[std == 0] = 1.0
+        weights = np.array(model.get("weights", [0.0] * len(model_features)), dtype=float)
+        values = np.array([float(features.get(name, 0.0)) for name in model_features], dtype=float)
+        contributions = ((values - mean) / std) * weights
+        frame = pd.DataFrame({"feature": model_features, "contribution": contributions}).sort_values("contribution", key=lambda s: s.abs(), ascending=False).head(8)
+        base = float(model.get("bias", 0.0))
+        title = f"Score explanation for {row.get('symbol', '-')}"
+    else:
+        frame = pd.DataFrame(
+            {
+                "feature": ["Stretch", "Expected move", "Liquidity", "Funding/OI", "Trend risk"],
+                "contribution": [
+                    float(features.get("z_abs", 0.0)) * 0.08,
+                    float(features.get("expected_reversion_bps", 0.0)) / 250,
+                    -abs(float(features.get("spread_bps", 0.0))) / 40,
+                    -abs(float(features.get("funding_pressure", 0.0))) * 0.2,
+                    -max(float(features.get("adx", 0.0)) - 25, 0.0) / 100,
+                ],
+            }
+        )
+        base = 0.0
+        title = f"Heuristic explanation for {row.get('symbol', '-')}"
+    fig = go.Figure(go.Waterfall(name="score", orientation="v", measure=["absolute"] + ["relative"] * len(frame), x=["Base"] + frame["feature"].tolist(), y=[base] + frame["contribution"].astype(float).tolist()))
+    fig.update_layout(title=title)
+    return dark_figure(fig, height=300)
+
+
 def pnl_learning_chart(engine: Engine | None, pnl: dict[str, Any]) -> go.Figure:
     rows = db_rows(engine, "SELECT ts, equity, daily_pnl, current_dd_pct FROM pnl_snapshots ORDER BY ts ASC LIMIT 120")
     frame = pd.DataFrame(rows)
@@ -2711,6 +2935,34 @@ def render_ui() -> None:
             st.plotly_chart(model_learning_chart(engine, rows), width="stretch")
         with l2:
             st.plotly_chart(training_growth_chart(engine), width="stretch")
+        q1, q2 = st.columns(2)
+        with q1:
+            st.markdown("<div class='sb-panel-title'>Feature Importance</div>", unsafe_allow_html=True)
+            st.plotly_chart(feature_importance_chart(model, latest_candidate), width="stretch")
+        with q2:
+            st.markdown("<div class='sb-panel-title'>Feature Drift</div>", unsafe_allow_html=True)
+            st.plotly_chart(feature_drift_chart(engine, rows), width="stretch")
+        q3, q4 = st.columns(2)
+        with q3:
+            st.markdown("<div class='sb-panel-title'>Prediction Confidence Trend</div>", unsafe_allow_html=True)
+            st.plotly_chart(prediction_confidence_trend_chart(engine, rows), width="stretch")
+        with q4:
+            st.markdown("<div class='sb-panel-title'>Hit Rate by Feature Bucket</div>", unsafe_allow_html=True)
+            st.plotly_chart(hit_rate_by_feature_bucket_chart(engine), width="stretch")
+        q5, q6 = st.columns(2)
+        with q5:
+            st.markdown("<div class='sb-panel-title'>Expected vs Actual Reversion</div>", unsafe_allow_html=True)
+            st.plotly_chart(expected_vs_actual_reversion_chart(engine), width="stretch")
+        with q6:
+            st.markdown("<div class='sb-panel-title'>Slippage vs Spread</div>", unsafe_allow_html=True)
+            st.plotly_chart(slippage_vs_spread_chart(engine), width="stretch")
+        q7, q8 = st.columns(2)
+        with q7:
+            st.markdown("<div class='sb-panel-title'>Funding / Open Interest Pressure</div>", unsafe_allow_html=True)
+            st.plotly_chart(funding_oi_pressure_chart(engine, rows), width="stretch")
+        with q8:
+            st.markdown("<div class='sb-panel-title'>Model Score Waterfall</div>", unsafe_allow_html=True)
+            st.plotly_chart(model_score_waterfall_chart(model, best), width="stretch")
         cov_left, cov_right = st.columns([1.05, 1])
         with cov_left:
             render_detail_table(st, "Daily Labeled Outcome Coverage", training_coverage_rows(engine))
