@@ -41,6 +41,18 @@ case "$ACTION" in
       echo "UI health: unavailable"
     fi
     ;;
+  logs)
+    compose --profile ui logs --tail "${TAIL_LINES:-120}" "${@:2}"
+    ;;
+  db)
+    compose exec mariadb sh -lc 'mariadb -u"$MYSQL_USER" -p"$MYSQL_PASSWORD" "$MYSQL_DATABASE"'
+    ;;
+  redis)
+    compose exec redis redis-cli
+    ;;
+  troubleshoot)
+    bash scripts/troubleshoot_ubuntu.sh
+    ;;
   performance)
     if docker_ready; then
       compose run --rm --no-deps worker-signal python scripts/performance_report.py --env-file "$ENV_FILE"
@@ -59,7 +71,7 @@ case "$ACTION" in
     compose --profile ui down
     ;;
   *)
-    echo "Usage: scripts/horizonctl.sh {start-backend|start-ui|health|status|performance|performance-json|stop}"
+    echo "Usage: scripts/horizonctl.sh {start-backend|start-ui|health|status|logs|db|redis|troubleshoot|performance|performance-json|stop}"
     exit 2
     ;;
 esac

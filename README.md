@@ -62,4 +62,31 @@ bash scripts/horizonctl.sh performance-json
 
 From the UI, open the Streamlit dashboard and switch to `Trading Dashboard`.
 
+## Troubleshoot Directly On The Droplet
+
+After a GitHub check-in, use the droplet as the source of truth for deployed runtime health:
+
+```bash
+cd /home/myts/superbot
+git pull
+sudo systemctl restart horizon-backend
+sudo systemctl restart horizon-ui
+
+bash scripts/horizonctl.sh status
+bash scripts/horizonctl.sh health
+bash scripts/horizonctl.sh performance
+bash scripts/horizonctl.sh troubleshoot
+```
+
+Useful direct consoles:
+
+```bash
+bash scripts/horizonctl.sh logs
+bash scripts/horizonctl.sh logs worker-ml worker-signal worker-order
+bash scripts/horizonctl.sh db
+bash scripts/horizonctl.sh redis
+```
+
+`troubleshoot` prints git deployment state, redacted runtime config, host capacity, systemd status, Docker Compose state, recent service logs, Redis state, MariaDB counts, worker heartbeat, active model registry rows, recent signals, open positions, audit events, health, and performance. Secrets are reported only as `<set>` or `<missing-or-placeholder>`.
+
 For the full operational runbook, see [README_RUN.md](README_RUN.md).
