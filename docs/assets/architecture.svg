@@ -1,116 +1,157 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="720" viewBox="0 0 1280 720" role="img" aria-labelledby="title desc">
-  <title id="title">Superbot architecture diagram</title>
-  <desc id="desc">Architecture showing public exchanges flowing into market data, signal, risk and ML, order management, P and L workers, with Redis and MariaDB persistence and optional Streamlit UI.</desc>
+<svg xmlns="http://www.w3.org/2000/svg" width="1440" height="900" viewBox="0 0 1440 900" role="img" aria-labelledby="title desc">
+  <title id="title">Superbot institutional trading lab architecture</title>
+  <desc id="desc">A production architecture diagram showing public exchange data flowing through headless workers into Redis and MariaDB, with optional Streamlit UI and Ubuntu systemd deployment.</desc>
   <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f8fafc"/>
+      <stop offset="0.55" stop-color="#eef6ff"/>
+      <stop offset="1" stop-color="#f7fee7"/>
+    </linearGradient>
+    <linearGradient id="ingest" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#dbeafe"/>
+      <stop offset="1" stop-color="#bfdbfe"/>
+    </linearGradient>
+    <linearGradient id="signal" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fff7ed"/>
+      <stop offset="1" stop-color="#fed7aa"/>
+    </linearGradient>
+    <linearGradient id="risk" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#f5f3ff"/>
+      <stop offset="1" stop-color="#ddd6fe"/>
+    </linearGradient>
+    <linearGradient id="orders" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#fef2f2"/>
+      <stop offset="1" stop-color="#fecaca"/>
+    </linearGradient>
+    <linearGradient id="pnl" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0" stop-color="#ecfdf5"/>
+      <stop offset="1" stop-color="#bbf7d0"/>
+    </linearGradient>
+    <filter id="shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="10" stdDeviation="12" flood-color="#0f172a" flood-opacity="0.14"/>
+    </filter>
+    <marker id="arrow-blue" markerWidth="12" markerHeight="12" refX="10" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,8 L11,4 z" fill="#2563eb"/>
+    </marker>
+    <marker id="arrow-green" markerWidth="12" markerHeight="12" refX="10" refY="4" orient="auto" markerUnits="strokeWidth">
+      <path d="M0,0 L0,8 L11,4 z" fill="#059669"/>
+    </marker>
     <style>
-      .bg{fill:#f8fafc}
-      .title{font:700 30px Arial,sans-serif;fill:#0f172a}
-      .subtitle{font:400 15px Arial,sans-serif;fill:#475569}
-      .box{fill:#ffffff;stroke:#cbd5e1;stroke-width:2;rx:12}
-      .box-blue{fill:#eff6ff;stroke:#60a5fa}
-      .box-green{fill:#ecfdf5;stroke:#34d399}
-      .box-amber{fill:#fffbeb;stroke:#f59e0b}
-      .box-red{fill:#fef2f2;stroke:#f87171}
-      .box-purple{fill:#f5f3ff;stroke:#a78bfa}
-      .box-slate{fill:#f1f5f9;stroke:#94a3b8}
-      .h{font:700 17px Arial,sans-serif;fill:#0f172a}
-      .t{font:400 13px Arial,sans-serif;fill:#334155}
-      .small{font:400 12px Arial,sans-serif;fill:#475569}
-      .arrow{stroke:#2563eb;stroke-width:3;fill:none;marker-end:url(#arrow)}
-      .arrow-green{stroke:#059669;stroke-width:3;fill:none;marker-end:url(#arrow-green)}
-      .arrow-gray{stroke:#64748b;stroke-width:2.5;fill:none;marker-end:url(#arrow-gray)}
-      .dash{stroke-dasharray:8 7}
+      .title{font:800 38px Arial,sans-serif;fill:#0f172a}
+      .subtitle{font:400 17px Arial,sans-serif;fill:#475569}
+      .section{font:700 14px Arial,sans-serif;fill:#334155;letter-spacing:.6px}
+      .card{stroke:#cbd5e1;stroke-width:1.6;rx:18;filter:url(#shadow)}
+      .store{fill:#ffffff;stroke:#94a3b8;stroke-width:2;rx:18;filter:url(#shadow)}
+      .h{font:800 20px Arial,sans-serif;fill:#0f172a}
+      .t{font:400 14px Arial,sans-serif;fill:#334155}
+      .mini{font:700 12px Arial,sans-serif;fill:#475569}
+      .pill{fill:#0f172a;rx:12}
+      .pillText{font:700 12px Arial,sans-serif;fill:#ffffff}
+      .flow{stroke:#2563eb;stroke-width:4;fill:none;marker-end:url(#arrow-blue)}
+      .persist{stroke:#059669;stroke-width:3;fill:none;marker-end:url(#arrow-green)}
+      .dash{stroke-dasharray:10 8}
+      .muted{stroke:#94a3b8;stroke-width:2.5;fill:none}
+      .icon{font:700 24px Arial,sans-serif;fill:#0f172a}
     </style>
-    <marker id="arrow" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
-      <path d="M0,0 L0,6 L9,3 z" fill="#2563eb"/>
-    </marker>
-    <marker id="arrow-green" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
-      <path d="M0,0 L0,6 L9,3 z" fill="#059669"/>
-    </marker>
-    <marker id="arrow-gray" markerWidth="10" markerHeight="10" refX="8" refY="3" orient="auto" markerUnits="strokeWidth">
-      <path d="M0,0 L0,6 L9,3 z" fill="#64748b"/>
-    </marker>
   </defs>
 
-  <rect class="bg" x="0" y="0" width="1280" height="720"/>
-  <text class="title" x="40" y="54">Superbot Trading Lab - Production Architecture</text>
-  <text class="subtitle" x="40" y="82">Headless backend workers with optional Streamlit UI, Redis latest-state cache, and MariaDB source of record.</text>
+  <rect width="1440" height="900" fill="url(#bg)"/>
+  <rect x="28" y="26" width="1384" height="848" rx="28" fill="#ffffff" opacity="0.72" stroke="#dbe4ef"/>
 
-  <rect class="box box-blue" x="40" y="130" width="180" height="120"/>
-  <text class="h" x="62" y="164">Public Exchanges</text>
-  <text class="t" x="62" y="191">Binance public APIs</text>
-  <text class="t" x="62" y="211">Candles, order book</text>
-  <text class="t" x="62" y="231">Funding, open interest</text>
+  <text class="title" x="70" y="84">Superbot Trading Lab</text>
+  <text class="subtitle" x="72" y="113">Headless trading backend, optional UI, persistent audit trail, and command-line performance reporting.</text>
 
-  <rect class="box box-green" x="270" y="130" width="190" height="120"/>
-  <text class="h" x="292" y="164">Market Data Worker</text>
-  <text class="t" x="292" y="191">Normalize candles</text>
-  <text class="t" x="292" y="211">Calculate indicators</text>
-  <text class="t" x="292" y="231">Publish latest state</text>
+  <rect class="pill" x="1030" y="56" width="134" height="28"/>
+  <text class="pillText" x="1050" y="75">HEADLESS READY</text>
+  <rect class="pill" x="1180" y="56" width="148" height="28"/>
+  <text class="pillText" x="1200" y="75">UI IS OPTIONAL</text>
 
-  <rect class="box box-amber" x="510" y="130" width="190" height="120"/>
-  <text class="h" x="532" y="164">Signal Worker</text>
-  <text class="t" x="532" y="191">Mean reversion score</text>
-  <text class="t" x="532" y="211">Feature snapshots</text>
-  <text class="t" x="532" y="231">Candidate signals</text>
+  <text class="section" x="75" y="165">DATA AND DECISION FLOW</text>
 
-  <rect class="box box-purple" x="750" y="130" width="190" height="120"/>
-  <text class="h" x="772" y="164">Risk + ML Workers</text>
-  <text class="t" x="772" y="191">Drawdown and drift</text>
-  <text class="t" x="772" y="211">Confidence scoring</text>
-  <text class="t" x="772" y="231">Deployment gates</text>
+  <rect class="card" x="70" y="190" width="190" height="170" fill="url(#ingest)"/>
+  <text class="icon" x="92" y="225">01</text>
+  <text class="h" x="92" y="260">Exchange Data</text>
+  <text class="t" x="92" y="290">Binance public APIs</text>
+  <text class="t" x="92" y="314">Candles, order book</text>
+  <text class="t" x="92" y="338">Funding, open interest</text>
 
-  <rect class="box box-red" x="990" y="130" width="220" height="120"/>
-  <text class="h" x="1012" y="164">Order Mgmt Worker</text>
-  <text class="t" x="1012" y="191">Final risk re-check</text>
-  <text class="t" x="1012" y="211">Paper/Testnet orders</text>
-  <text class="t" x="1012" y="231">Position open events</text>
+  <rect class="card" x="310" y="190" width="205" height="170" fill="url(#ingest)"/>
+  <text class="icon" x="332" y="225">02</text>
+  <text class="h" x="332" y="260">Market Data</text>
+  <text class="t" x="332" y="290">Normalizes feeds</text>
+  <text class="t" x="332" y="314">Calculates indicators</text>
+  <text class="t" x="332" y="338">Publishes latest state</text>
 
-  <rect class="box box-green" x="990" y="315" width="220" height="120"/>
-  <text class="h" x="1012" y="349">P&amp;L Worker</text>
-  <text class="t" x="1012" y="376">Mark to market</text>
-  <text class="t" x="1012" y="396">Stops and targets</text>
-  <text class="t" x="1012" y="416">Realized performance</text>
+  <rect class="card" x="565" y="190" width="205" height="170" fill="url(#signal)"/>
+  <text class="icon" x="587" y="225">03</text>
+  <text class="h" x="587" y="260">Signal Engine</text>
+  <text class="t" x="587" y="290">Mean-reversion score</text>
+  <text class="t" x="587" y="314">Feature snapshots</text>
+  <text class="t" x="587" y="338">Candidate entries</text>
 
-  <rect class="box box-slate" x="270" y="315" width="300" height="150"/>
-  <text class="h" x="292" y="349">Redis</text>
-  <text class="t" x="292" y="376">Fast latest state</text>
-  <text class="t" x="292" y="396">Worker health and locks</text>
-  <text class="t" x="292" y="416">Pub/sub event streams</text>
-  <text class="small" x="292" y="445">Disposable cache rebuilt from source of record</text>
+  <rect class="card" x="820" y="190" width="205" height="170" fill="url(#risk)"/>
+  <text class="icon" x="842" y="225">04</text>
+  <text class="h" x="842" y="260">Risk + ML</text>
+  <text class="t" x="842" y="290">Drift and drawdown</text>
+  <text class="t" x="842" y="314">Model confidence</text>
+  <text class="t" x="842" y="338">Deployment gates</text>
 
-  <rect class="box box-slate" x="630" y="315" width="300" height="150"/>
-  <text class="h" x="652" y="349">MariaDB</text>
-  <text class="t" x="652" y="376">Signals, orders, executions</text>
-  <text class="t" x="652" y="396">Positions, P&amp;L, audit log</text>
-  <text class="t" x="652" y="416">Model registry and training data</text>
-  <text class="small" x="652" y="445">Permanent source of record</text>
+  <rect class="card" x="1075" y="190" width="250" height="170" fill="url(#orders)"/>
+  <text class="icon" x="1097" y="225">05</text>
+  <text class="h" x="1097" y="260">Order Management</text>
+  <text class="t" x="1097" y="290">Final risk re-check</text>
+  <text class="t" x="1097" y="314">Paper/Testnet orders</text>
+  <text class="t" x="1097" y="338">Position creation</text>
 
-  <rect class="box box-blue" x="270" y="535" width="300" height="110"/>
-  <text class="h" x="292" y="569">Optional Streamlit UI</text>
-  <text class="t" x="292" y="596">Dashboard, charts, install guide</text>
-  <text class="t" x="292" y="616">Reads Redis and MariaDB only</text>
+  <path class="flow" d="M260 275 H310"/>
+  <path class="flow" d="M515 275 H565"/>
+  <path class="flow" d="M770 275 H820"/>
+  <path class="flow" d="M1025 275 H1075"/>
 
-  <rect class="box box-amber" x="630" y="535" width="300" height="110"/>
-  <text class="h" x="652" y="569">Ubuntu / DigitalOcean</text>
-  <text class="t" x="652" y="596">systemd backend service</text>
-  <text class="t" x="652" y="616">Private env file, no secrets in GitHub</text>
+  <rect class="card" x="1075" y="430" width="250" height="150" fill="url(#pnl)"/>
+  <text class="icon" x="1097" y="465">06</text>
+  <text class="h" x="1097" y="500">P&amp;L Worker</text>
+  <text class="t" x="1097" y="529">Marks positions</text>
+  <text class="t" x="1097" y="553">Stops, targets, exits</text>
 
-  <path class="arrow" d="M220 190 H270"/>
-  <path class="arrow" d="M460 190 H510"/>
-  <path class="arrow" d="M700 190 H750"/>
-  <path class="arrow" d="M940 190 H990"/>
-  <path class="arrow" d="M1100 250 V315"/>
+  <path class="flow" d="M1200 360 V430"/>
 
-  <path class="arrow-green" d="M365 250 V315"/>
-  <path class="arrow-green" d="M605 250 C605 285 515 285 515 315"/>
-  <path class="arrow-green" d="M845 250 V315"/>
-  <path class="arrow-green" d="M990 374 H930"/>
+  <text class="section" x="75" y="426">STATE, AUDIT AND OBSERVABILITY</text>
+  <rect class="store" x="75" y="455" width="360" height="170"/>
+  <text class="h" x="105" y="495">Redis latest-state cache</text>
+  <text class="t" x="105" y="528">Live prices, signals, P&amp;L, risk, drift</text>
+  <text class="t" x="105" y="554">Worker heartbeats, locks and pub/sub</text>
+  <text class="mini" x="105" y="592">Fast and rebuildable</text>
 
-  <path class="arrow-gray dash" d="M420 535 V465"/>
-  <path class="arrow-gray dash" d="M570 590 H630"/>
-  <path class="arrow-gray dash" d="M780 535 V465"/>
-  <path class="arrow-gray" d="M780 535 C780 500 1040 500 1100 435"/>
+  <rect class="store" x="495" y="455" width="390" height="170"/>
+  <text class="h" x="525" y="495">MariaDB source of record</text>
+  <text class="t" x="525" y="528">Signals, orders, executions, positions</text>
+  <text class="t" x="525" y="554">Model registry, outcomes, audit log</text>
+  <text class="mini" x="525" y="592">Durable and auditable</text>
 
-  <text class="small" x="40" y="685">Default run mode is headless backend. Start the UI only when you need the dashboard: docker compose --profile ui up -d horizon-ui.</text>
+  <path class="persist" d="M412 360 C412 407 270 407 255 455"/>
+  <path class="persist" d="M668 360 C668 408 622 408 620 455"/>
+  <path class="persist" d="M922 360 C922 408 762 408 742 455"/>
+  <path class="persist" d="M1075 515 H885"/>
+
+  <rect class="store" x="75" y="690" width="360" height="120"/>
+  <text class="h" x="105" y="730">Optional Streamlit UI</text>
+  <text class="t" x="105" y="760">Renders dashboard, charts and install help</text>
+  <text class="mini" x="105" y="788">Can be stopped while backend continues</text>
+
+  <rect class="store" x="495" y="690" width="390" height="120"/>
+  <text class="h" x="525" y="730">Command-line performance</text>
+  <text class="t" x="525" y="760">scripts/horizonctl.sh performance</text>
+  <text class="mini" x="525" y="788">Works without opening the UI</text>
+
+  <rect class="store" x="945" y="690" width="380" height="120"/>
+  <text class="h" x="975" y="730">Ubuntu / DigitalOcean</text>
+  <text class="t" x="975" y="760">systemd backend and optional UI services</text>
+  <text class="mini" x="975" y="788">Private env file, no secrets in GitHub</text>
+
+  <path class="muted dash" d="M255 690 V625"/>
+  <path class="muted dash" d="M690 690 V625"/>
+  <path class="muted dash" d="M1135 690 C1135 640 1220 628 1220 580"/>
+
+  <text class="subtitle" x="70" y="855">Default production startup runs the backend workers only. Start the UI when you need visual monitoring; use CLI performance for headless operations.</text>
 </svg>

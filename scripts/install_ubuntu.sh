@@ -6,6 +6,7 @@ APP_USER="${APP_USER:-horizon}"
 REPO_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ENV_SOURCE="${ENV_SOURCE:-}"
 CHECK_ONLY=false
+SKIP_EXISTING_CHECK=false
 
 usage() {
   cat <<'USAGE'
@@ -17,6 +18,7 @@ Options:
   --env-file PATH         Copy an environment-specific env file to /opt/horizon-lab/.env.
   --app-dir PATH          Install location. Default: /opt/horizon-lab.
   --app-user USER         System user owner. Default: horizon.
+  --skip-existing-check   Do not print existing app/systemd/Docker inspection before install.
   -h, --help              Show help.
 
 Secrets policy:
@@ -56,6 +58,10 @@ while [[ $# -gt 0 ]]; do
       fi
       shift 2
       ;;
+    --skip-existing-check)
+      SKIP_EXISTING_CHECK=true
+      shift
+      ;;
     -h|--help)
       usage
       exit 0
@@ -86,6 +92,80 @@ require_file() {
   else
     check_fail "$label" "missing: $path"
   fi
+}
+
+inspect_existing_setup() {
+  local saved_check_status="$check_status"
+  echo "Horizon existing setup inspection"
+  echo "Repo: $REPO_DIR"
+  echo "App dir: $APP_DIR"
+
+  if [[ -d "$APP_DIR" ]]; then
+    check_ok "app directory exists"
+    if [[ -d "$APP_DIR/.git" ]]; then
+      check_ok "app git repo"
+      if command -v git >/dev/null 2>&1; then
+        git -C "$APP_DIR" rev-parse --short HEAD >/dev/null 2>&1 && echo "  current commit: $(git -C "$APP_DIR" rev-parse --short HEAD)"
+        git -C "$APP_DIR" status --short >/tmp/horizon_git_status.out 2>/dev/null || true
+        if [[ -s /tmp/horizon_git_status.out ]]; then
+          echo "  git status: local changes present"
+          sed 's/^/    /' /tmp/horizon_git_status.out | head -20
+        else
+          echo "  git status: clean"
+        fi
+      fi
+    else
+      check_fail "app git repo" "$APP_DIR exists but is not a git checkout"
+    fi
+  else
+    check_fail "app directory exists" "missing; installer will create it"
+  fi
+
+  if [[ -f "$APP_DIR/.env" ]]; then
+    check_ok "installed env file"
+    perms="$(stat -c '%a %U:%G' "$APP_DIR/.env" 2>/dev/null || echo unknown)"
+    echo "  env permissions: $perms"
+  else
+    check_fail "installed env file" "missing; installer will create/copy it"
+  fi
+
+  if [[ -n "$ENV_SOURCE" && -f "$ENV_SOURCE" ]]; then
+    check_ok "source env file"
+  elif [[ -n "$ENV_SOURCE" ]]; then
+    check_fail "source env file" "missing: $ENV_SOURCE"
+  fi
+
+  if systemctl list-unit-files --type=service --no-legend horizon-backend.service 2>/dev/null | grep -q '^horizon-backend\.service'; then
+    check_ok "systemd backend unit"
+    systemctl is-active horizon-backend.service >/dev/null 2>&1 && echo "  backend active: yes" || echo "  backend active: no"
+  else
+    check_fail "systemd backend unit" "not installed yet"
+  fi
+  if systemctl list-unit-files --type=service --no-legend horizon-ui.service 2>/dev/null | grep -q '^horizon-ui\.service'; then
+    check_ok "systemd ui unit"
+    systemctl is-active horizon-ui.service >/dev/null 2>&1 && echo "  ui active: yes" || echo "  ui active: no"
+  else
+    check_fail "systemd ui unit" "not installed yet"
+  fi
+
+  if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+    check_ok "docker daemon"
+    if [[ -f "$APP_DIR/docker-compose.prod.yml" ]]; then
+      (cd "$APP_DIR" && docker compose -f docker-compose.prod.yml --env-file .env ps) || true
+    else
+      echo "  compose status: app compose file not present yet"
+    fi
+  else
+    check_fail "docker daemon" "not available; installer can install/start Docker"
+  fi
+
+  if ss -ltnp 2>/dev/null | grep -Eq '(:8501)([[:space:]]|$)'; then
+    check_fail "port 8501" "already in use"
+    ss -ltnp 2>/dev/null | grep ':8501' | sed 's/^/  /' || true
+  else
+    check_ok "port 8501 free"
+  fi
+  check_status="$saved_check_status"
 }
 
 check_env_file() {
@@ -181,6 +261,8 @@ run_readiness_check() {
 }
 
 if [[ "$CHECK_ONLY" == "true" ]]; then
+  inspect_existing_setup
+  echo ""
   run_readiness_check
   exit "$?"
 fi
@@ -195,6 +277,11 @@ if [[ -n "$ENV_SOURCE" && ! -f "$ENV_SOURCE" ]]; then
   exit 1
 fi
 
+if [[ "$SKIP_EXISTING_CHECK" != "true" ]]; then
+  inspect_existing_setup
+  echo ""
+fi
+
 install_docker_engine() {
   install -m 0755 -d /etc/apt/keyrings
   rm -f /etc/apt/keyrings/docker.gpg
@@ -204,6 +291,17 @@ install_docker_engine() {
   echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu ${VERSION_CODENAME} stable" > /etc/apt/sources.list.d/docker.list
   apt-get update
   apt-get install -y docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+}
+
+install_systemd_units() {
+  local backend_tmp ui_tmp
+  backend_tmp="$(mktemp)"
+  ui_tmp="$(mktemp)"
+  sed "s|/opt/horizon-lab|$APP_DIR|g" "$APP_DIR/systemd/horizon-backend.service" > "$backend_tmp"
+  sed "s|/opt/horizon-lab|$APP_DIR|g" "$APP_DIR/systemd/horizon-ui.service" > "$ui_tmp"
+  install -m 0644 "$backend_tmp" /etc/systemd/system/horizon-backend.service
+  install -m 0644 "$ui_tmp" /etc/systemd/system/horizon-ui.service
+  rm -f "$backend_tmp" "$ui_tmp"
 }
 
 apt-get update
@@ -235,8 +333,7 @@ elif [[ ! -f "$APP_DIR/.env" ]]; then
   echo "Created placeholder $APP_DIR/.env from template. Replace placeholders before starting production."
 fi
 
-install -m 0644 "$APP_DIR/systemd/horizon-backend.service" /etc/systemd/system/horizon-backend.service
-install -m 0644 "$APP_DIR/systemd/horizon-ui.service" /etc/systemd/system/horizon-ui.service
+install_systemd_units
 systemctl daemon-reload
 systemctl enable horizon-backend.service
 

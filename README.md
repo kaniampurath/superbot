@@ -39,6 +39,8 @@ bash scripts/horizonctl.sh performance
 | `ENABLE_REAL_TESTNET_ORDERS` | Set `false` until Testnet credentials are ready | Yes |
 | `testnet_key` / `testnet_secret` | Binance Spot Testnet credentials | Only when Testnet orders are enabled |
 
+The installer checks the existing setup before installing: app directory, git checkout, env file, systemd services, Docker daemon, existing Compose services, and port `8501`.
+
 ## What Runs Headless
 
 The default backend stack starts MariaDB, Redis, market data, signal, risk, ML, order management, and P&L workers. The Streamlit UI is separate and optional.

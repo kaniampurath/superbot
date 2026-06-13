@@ -95,6 +95,8 @@ cd /opt/horizon-lab
 bash scripts/healthcheck_ubuntu.sh
 ```
 
+The installer inspects any existing setup before changing the machine: app directory, git checkout, env file permissions, systemd units, Docker daemon, running Compose services, and port `8501`. When `--app-dir` is provided, systemd units are rendered with that same path.
+
 Backend workers run headless through `horizon-backend.service`. The Streamlit UI is optional through `horizon-ui.service`; the system does not depend on the UI to ingest data, train ML, score signals, manage risk, queue orders, or track P&L.
 
 Release artifacts:

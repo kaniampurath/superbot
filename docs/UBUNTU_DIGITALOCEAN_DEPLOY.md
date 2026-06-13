@@ -46,6 +46,8 @@ sudo bash scripts/install_ubuntu.sh --check --env-file /root/horizon-prod.env
 
 The readiness check validates Ubuntu version, CPU architecture, memory, disk, required release files, Docker/Compose availability, port `8501`, absence of repo `.env`, required non-placeholder DB secrets, and Testnet credentials when `ENABLE_REAL_TESTNET_ORDERS=true`.
 
+Before either `--check` or install mode, the script also inspects any existing setup: app directory, git checkout, installed env file, source env file, systemd backend/UI units, Docker daemon, Compose service status, and port `8501`.
+
 ## 4. Install
 
 ```bash
@@ -58,7 +60,7 @@ The installer:
 - creates `/opt/horizon-lab`
 - copies this release bundle
 - installs the private env file as `/opt/horizon-lab/.env` with `0600` permissions
-- installs `horizon-backend.service` and `horizon-ui.service`
+- installs `horizon-backend.service` and `horizon-ui.service` with `WorkingDirectory` set to the chosen `--app-dir`
 - enables backend service
 
 ## 5. Start Headless Backend
