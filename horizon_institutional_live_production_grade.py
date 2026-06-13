@@ -11,6 +11,7 @@ import sys
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Iterable
 from urllib.parse import urlencode
 from uuid import uuid4
@@ -1904,8 +1905,6 @@ def production_progress_chart(state: RedisState, rows: list[dict[str, Any]], val
 
 
 def render_home_page(st: Any) -> None:
-    from streamlit.components.v1 import html
-
     st.title("Superbot Trading Lab")
     st.caption("A testnet-first trading system that collects market data, scores opportunities, checks risk, learns from outcomes, and can run without the web screen.")
 
@@ -1925,36 +1924,12 @@ def render_home_page(st: Any) -> None:
         st.metric("Symbols", str(len(CFG.symbols)))
         st.metric("Testnet Orders", "Enabled" if CFG.enable_real_testnet_orders else "Disabled")
 
-    html(
-        """
-        <style>
-          .arch-wrap{font-family:Arial,sans-serif;border:1px solid #d7dee8;border-radius:8px;padding:18px;background:#fbfdff}
-          .arch-title{font-weight:700;color:#0f172a;margin-bottom:12px;font-size:18px}
-          .arch-grid{display:grid;grid-template-columns:1fr 1fr 1fr 1fr;gap:12px;align-items:stretch}
-          .arch-card{border:1px solid #ccd6e2;border-radius:8px;background:white;padding:12px;min-height:98px}
-          .arch-card b{display:block;color:#0f172a;margin-bottom:6px}
-          .arch-card span{display:block;color:#475569;font-size:13px;line-height:1.35}
-          .arch-arrow{text-align:center;color:#2563eb;font-weight:700;padding-top:38px}
-          .arch-store{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin-top:12px}
-          .arch-note{margin-top:12px;color:#334155;font-size:13px}
-        </style>
-        <div class="arch-wrap">
-          <div class="arch-title">Architecture at a glance</div>
-          <div class="arch-grid">
-            <div class="arch-card"><b>1. Market Data</b><span>Pulls prices, candles, order book, funding, and open interest from public exchange APIs.</span></div>
-            <div class="arch-card"><b>2. Signal Worker</b><span>Looks for mean-reversion opportunities and writes candidate signals.</span></div>
-            <div class="arch-card"><b>3. Risk + ML</b><span>Checks drawdown, drift, exposure, validation history, and model confidence before deployment.</span></div>
-            <div class="arch-card"><b>4. Order + P&L</b><span>Creates paper or Spot Testnet orders, tracks positions, exits, and realized performance.</span></div>
-          </div>
-          <div class="arch-store">
-            <div class="arch-card"><b>MariaDB</b><span>Permanent record: signals, requests, orders, positions, P&L, model registry, audit log.</span></div>
-            <div class="arch-card"><b>Redis</b><span>Fast latest state: prices, worker health, live P&L, locks, and pub/sub events.</span></div>
-          </div>
-          <div class="arch-note">Streamlit UI reads from Redis and MariaDB. The backend does not require the UI to run.</div>
-        </div>
-        """,
-        height=360,
-    )
+    st.subheader("Architecture at a glance")
+    architecture_path = Path(__file__).resolve().parent / "docs" / "assets" / "architecture.svg"
+    if architecture_path.exists():
+        st.image(str(architecture_path), caption="Headless workers own trading operations; Streamlit renders state from Redis and MariaDB.")
+    else:
+        st.warning("Architecture image is missing from the runtime image. Check Dockerfile asset copy and docs/assets/architecture.svg.")
 
     st.subheader("Ubuntu install commands")
     st.code(
@@ -1998,7 +1973,7 @@ bash scripts/horizonctl.sh performance""",
 def render_ui() -> None:
     import streamlit as st
 
-    st.set_page_config(page_title="Horizon Institutional Lab", layout="wide", initial_sidebar_state="collapsed")
+    st.set_page_config(page_title="Horizon Institutional Lab", layout="wide", initial_sidebar_state="expanded")
     state, engine = RedisState(CFG), db_engine(CFG)
     init_schema(engine)
     rows = demo_rows(state)
@@ -2024,7 +1999,10 @@ def render_ui() -> None:
         """,
         unsafe_allow_html=True,
     )
-    page = st.radio("View", ["Home", "Trading Dashboard"], horizontal=True, label_visibility="collapsed")
+    with st.sidebar:
+        st.title("Superbot")
+        page = st.radio("View", ["Trading Dashboard", "Home"], index=0)
+        st.caption("Backend workers can run headless; this UI only renders current state, validation, and controls.")
     if page == "Home":
         render_home_page(st)
         return
