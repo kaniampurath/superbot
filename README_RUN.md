@@ -95,7 +95,7 @@ cd /opt/horizon-lab
 bash scripts/healthcheck_ubuntu.sh
 ```
 
-The installer inspects any existing setup before changing the machine: app directory, git checkout, env file permissions, systemd units, Docker daemon, running Compose services, and port `8501`. When `--app-dir` is provided, systemd units are rendered with that same path.
+The installer inspects any existing setup before changing the machine: app directory, git checkout, env file permissions, systemd units, Docker daemon, running Compose services, and the configured `UI_HOST_PORT`. When `--app-dir` is provided, systemd units are rendered with that same path.
 
 Backend workers run headless through `horizon-backend.service`. The Streamlit UI is optional through `horizon-ui.service`; the system does not depend on the UI to ingest data, train ML, score signals, manage risk, queue orders, or track P&L.
 
@@ -215,7 +215,7 @@ Redis locks and MariaDB unique idempotency keys prevent duplicate signal, deploy
 Use paper mode for validation. Check data quality, stale prices, spread/slippage, drawdown, drift, and execution assumptions before any deployment.
 
 ## Troubleshooting
-- `ERR_CONNECTION_REFUSED`: the Streamlit service is not running on `8501`.
+- `ERR_CONNECTION_REFUSED`: the Streamlit service is not running on the configured `UI_HOST_PORT`, default `8501`.
 - Missing dashboard data: check Redis and worker heartbeats.
 - Database errors: confirm MariaDB health and credentials.
 - Binance failures: workers mark data as `SIMULATED` and continue.

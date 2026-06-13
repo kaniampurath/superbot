@@ -4,6 +4,8 @@ set -u
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
 PROJECT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$PROJECT_DIR" || exit 1
+UI_HOST_PORT="${UI_HOST_PORT:-$(grep -E '^UI_HOST_PORT=' .env 2>/dev/null | tail -1 | cut -d= -f2-)}"
+UI_HOST_PORT="${UI_HOST_PORT:-8501}"
 
 fail=0
 check() {
@@ -30,7 +32,7 @@ check "mariadb service" "docker compose -f $COMPOSE_FILE --env-file .env ps mari
 check "redis service" "docker compose -f $COMPOSE_FILE --env-file .env ps redis"
 check "backend services" "docker compose -f $COMPOSE_FILE --env-file .env ps worker-marketdata worker-signal worker-risk worker-ml worker-order worker-pnl"
 
-if curl -fsS --max-time 3 http://127.0.0.1:8501/_stcore/health >/tmp/horizon_ui_health.out 2>/tmp/horizon_ui_health.err; then
+if curl -fsS --max-time 3 "http://127.0.0.1:${UI_HOST_PORT}/_stcore/health" >/tmp/horizon_ui_health.out 2>/tmp/horizon_ui_health.err; then
   printf "%-32s OK\n" "ui health"
 else
   printf "%-32s SKIP/FAIL\n" "ui health"

@@ -38,8 +38,9 @@ bash scripts/horizonctl.sh performance
 | `MYSQL_ROOT_PASSWORD` | MariaDB root password | Yes |
 | `ENABLE_REAL_TESTNET_ORDERS` | Set `false` until Testnet credentials are ready | Yes |
 | `testnet_key` / `testnet_secret` | Binance Spot Testnet credentials | Only when Testnet orders are enabled |
+| `UI_HOST_PORT` | External Streamlit port, for example `8502` when `8501` is busy | No |
 
-The installer checks the existing setup before installing: app directory, git checkout, env file, systemd services, Docker daemon, existing Compose services, and port `8501`.
+The installer checks the existing setup before installing: app directory, git checkout, env file, systemd services, Docker daemon, existing Compose services, and the configured `UI_HOST_PORT`.
 
 ## What Runs Headless
 

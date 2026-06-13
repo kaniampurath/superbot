@@ -6,6 +6,8 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 COMPOSE_FILE="${COMPOSE_FILE:-docker-compose.prod.yml}"
 ENV_FILE="${ENV_FILE:-.env}"
 cd "$ROOT"
+UI_HOST_PORT="${UI_HOST_PORT:-$(grep -E '^UI_HOST_PORT=' "$ENV_FILE" 2>/dev/null | tail -1 | cut -d= -f2-)}"
+UI_HOST_PORT="${UI_HOST_PORT:-8501}"
 
 compose() {
   docker compose -f "$COMPOSE_FILE" --env-file "$ENV_FILE" "$@"
@@ -33,7 +35,7 @@ case "$ACTION" in
     else
       echo "Docker daemon: unavailable"
     fi
-    if curl -fsS --max-time 3 http://127.0.0.1:8501/_stcore/health >/dev/null; then
+    if curl -fsS --max-time 3 "http://127.0.0.1:${UI_HOST_PORT}/_stcore/health" >/dev/null; then
       echo "UI health: ok"
     else
       echo "UI health: unavailable"

@@ -94,11 +94,39 @@ require_file() {
   fi
 }
 
+env_file_value() {
+  local env_file="$1"
+  local key="$2"
+  local default="$3"
+  if [[ -f "$env_file" ]]; then
+    local value
+    value="$(grep -E "^${key}=" "$env_file" | tail -1 | cut -d= -f2- | tr -d '"' | tr -d "'" || true)"
+    if [[ -n "$value" ]]; then
+      echo "$value"
+      return
+    fi
+  fi
+  echo "$default"
+}
+
+ui_host_port() {
+  if [[ -n "$ENV_SOURCE" ]]; then
+    env_file_value "$ENV_SOURCE" "UI_HOST_PORT" "8501"
+  elif [[ -f "$APP_DIR/.env" ]]; then
+    env_file_value "$APP_DIR/.env" "UI_HOST_PORT" "8501"
+  else
+    echo "8501"
+  fi
+}
+
 inspect_existing_setup() {
   local saved_check_status="$check_status"
+  local ui_port
+  ui_port="$(ui_host_port)"
   echo "Horizon existing setup inspection"
   echo "Repo: $REPO_DIR"
   echo "App dir: $APP_DIR"
+  echo "UI host port: $ui_port"
 
   if [[ -d "$APP_DIR" ]]; then
     check_ok "app directory exists"
@@ -151,7 +179,11 @@ inspect_existing_setup() {
   if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
     check_ok "docker daemon"
     if [[ -f "$APP_DIR/docker-compose.prod.yml" ]]; then
-      (cd "$APP_DIR" && docker compose -f docker-compose.prod.yml --env-file .env ps) || true
+      local compose_env_file=".env"
+      if [[ ! -f "$APP_DIR/.env" && -n "$ENV_SOURCE" && -f "$ENV_SOURCE" ]]; then
+        compose_env_file="$ENV_SOURCE"
+      fi
+      (cd "$APP_DIR" && HORIZON_ENV_FILE="$compose_env_file" docker compose -f docker-compose.prod.yml --env-file "$compose_env_file" ps) || true
     else
       echo "  compose status: app compose file not present yet"
     fi
@@ -159,11 +191,11 @@ inspect_existing_setup() {
     check_fail "docker daemon" "not available; installer can install/start Docker"
   fi
 
-  if ss -ltnp 2>/dev/null | grep -Eq '(:8501)([[:space:]]|$)'; then
-    check_fail "port 8501" "already in use"
-    ss -ltnp 2>/dev/null | grep ':8501' | sed 's/^/  /' || true
+  if ss -ltnp 2>/dev/null | grep -Eq "(:${ui_port})([[:space:]]|$)"; then
+    check_fail "port ${ui_port}" "already in use"
+    ss -ltnp 2>/dev/null | grep ":${ui_port}" | sed 's/^/  /' || true
   else
-    check_ok "port 8501 free"
+    check_ok "port ${ui_port} free"
   fi
   check_status="$saved_check_status"
 }
@@ -197,9 +229,12 @@ check_env_file() {
 }
 
 run_readiness_check() {
+  local ui_port
+  ui_port="$(ui_host_port)"
   echo "Horizon Ubuntu readiness check"
   echo "Repo: $REPO_DIR"
   echo "App dir: $APP_DIR"
+  echo "UI host port: $ui_port"
 
   if [[ -f /etc/os-release ]]; then
     . /etc/os-release
@@ -232,16 +267,25 @@ run_readiness_check() {
   command -v docker >/dev/null 2>&1 && check_ok "docker installed" || check_fail "docker installed" "missing; installer can add it"
   docker compose version >/dev/null 2>&1 && check_ok "docker compose plugin" || check_fail "docker compose plugin" "missing; installer can add it"
 
-  if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq '(:8501)$'; then
-    check_fail "port 8501 available" "already in use"
+  if ss -ltn 2>/dev/null | awk '{print $4}' | grep -Eq "(:${ui_port})$"; then
+    check_fail "port ${ui_port} available" "already in use"
   else
-    check_ok "port 8501 available"
+    check_ok "port ${ui_port} available"
   fi
 
   require_file "$REPO_DIR/Dockerfile" "Dockerfile"
   require_file "$REPO_DIR/docker-compose.prod.yml" "production compose"
   require_file "$REPO_DIR/sql/init/001_schema.sql" "database init script"
   require_file "$REPO_DIR/.env.production.example" "env template"
+  if [[ -f "$REPO_DIR/docker-compose.prod.yml" ]]; then
+    local compose_env_file="${ENV_SOURCE:-$APP_DIR/.env}"
+    if [[ -f "$compose_env_file" ]] && HORIZON_ENV_FILE="$compose_env_file" docker compose -f "$REPO_DIR/docker-compose.prod.yml" --env-file "$compose_env_file" config >/tmp/horizon_compose_config.out 2>/tmp/horizon_compose_config.err; then
+      check_ok "production compose config"
+    else
+      check_fail "production compose config" "invalid or env file missing"
+      sed 's/^/  /' /tmp/horizon_compose_config.err 2>/dev/null | tail -5 || true
+    fi
+  fi
 
   if [[ -n "$ENV_SOURCE" ]]; then
     check_env_file "$ENV_SOURCE" "external env file"
@@ -338,7 +382,7 @@ systemctl daemon-reload
 systemctl enable horizon-backend.service
 
 ufw allow OpenSSH >/dev/null || true
-ufw allow 8501/tcp >/dev/null || true
+ufw allow "$(ui_host_port)/tcp" >/dev/null || true
 
 echo "Install complete."
 echo "1) Verify env: sudo bash $APP_DIR/scripts/install_ubuntu.sh --check --env-file $APP_DIR/.env"

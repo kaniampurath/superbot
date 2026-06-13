@@ -44,9 +44,9 @@ Run the installer in check-only mode before installing:
 sudo bash scripts/install_ubuntu.sh --check --env-file /root/horizon-prod.env
 ```
 
-The readiness check validates Ubuntu version, CPU architecture, memory, disk, required release files, Docker/Compose availability, port `8501`, absence of repo `.env`, required non-placeholder DB secrets, and Testnet credentials when `ENABLE_REAL_TESTNET_ORDERS=true`.
+The readiness check validates Ubuntu version, CPU architecture, memory, disk, required release files, Docker/Compose availability, configured `UI_HOST_PORT`, absence of repo `.env`, required non-placeholder DB secrets, and Testnet credentials when `ENABLE_REAL_TESTNET_ORDERS=true`.
 
-Before either `--check` or install mode, the script also inspects any existing setup: app directory, git checkout, installed env file, source env file, systemd backend/UI units, Docker daemon, Compose service status, and port `8501`.
+Before either `--check` or install mode, the script also inspects any existing setup: app directory, git checkout, installed env file, source env file, systemd backend/UI units, Docker daemon, Compose service status, and the configured `UI_HOST_PORT`.
 
 ## 4. Install
 
@@ -91,6 +91,18 @@ Open:
 
 ```text
 http://<droplet-ip>:8501
+```
+
+If port `8501` is already in use, set this in your private env file before install:
+
+```text
+UI_HOST_PORT=8502
+```
+
+Then open:
+
+```text
+http://<droplet-ip>:8502
 ```
 
 For public internet use, restrict access with firewall rules, SSH tunnel, or a reverse proxy with authentication.

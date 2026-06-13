@@ -6,6 +6,7 @@ param(
 $ErrorActionPreference = "Stop"
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 Set-Location $Root
+$UiHostPort = if ($env:UI_HOST_PORT) { $env:UI_HOST_PORT } else { "8501" }
 
 function Write-Check {
     param([string]$Name, [bool]$Ok, [string]$Detail = "")
@@ -83,12 +84,12 @@ function Invoke-Health {
 
     $uiHealth = $false
     try {
-        $response = Invoke-WebRequest "http://127.0.0.1:8501/_stcore/health" -UseBasicParsing -TimeoutSec 3
+        $response = Invoke-WebRequest "http://127.0.0.1:$UiHostPort/_stcore/health" -UseBasicParsing -TimeoutSec 3
         $uiHealth = $response.Content.Trim() -eq "ok"
     } catch {
         $uiHealth = $false
     }
-    Write-Check "local UI health" $uiHealth "http://127.0.0.1:8501/_stcore/health"
+    Write-Check "local UI health" $uiHealth "http://127.0.0.1:$UiHostPort/_stcore/health"
 
     if ($failed) { exit 1 }
 }
@@ -103,7 +104,7 @@ switch ($Action) {
         docker compose --profile ui ps
     }
     "local-ui" {
-        python -m streamlit run horizon_institutional_live_production_grade.py --server.address=127.0.0.1 --server.port=8501
+        python -m streamlit run horizon_institutional_live_production_grade.py --server.address=127.0.0.1 --server.port=$UiHostPort
     }
     "health" {
         Invoke-Health
@@ -115,7 +116,7 @@ switch ($Action) {
             Write-Host "Docker daemon: unavailable"
         }
         try {
-            $response = Invoke-WebRequest "http://127.0.0.1:8501/_stcore/health" -UseBasicParsing -TimeoutSec 3
+            $response = Invoke-WebRequest "http://127.0.0.1:$UiHostPort/_stcore/health" -UseBasicParsing -TimeoutSec 3
             Write-Host "UI health: $($response.Content.Trim())"
         } catch {
             Write-Host "UI health: unavailable"

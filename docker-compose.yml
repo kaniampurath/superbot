@@ -34,7 +34,7 @@ services:
     environment:
       RUN_MODE: ui
     ports:
-      - "8501:8501"
+      - "${UI_HOST_PORT:-8501}:8501"
     depends_on:
       mariadb:
         condition: service_healthy
