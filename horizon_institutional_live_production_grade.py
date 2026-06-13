@@ -169,7 +169,17 @@ class RedisState:
         if redis is None:
             return
         try:
-            self.client = redis.Redis(host=cfg.redis_host, port=cfg.redis_port, decode_responses=True, socket_connect_timeout=1)
+            if cfg.run_mode == "ui" and cfg.redis_host in {"localhost", "127.0.0.1", "::1"}:
+                probe = socket.create_connection((cfg.redis_host, cfg.redis_port), timeout=0.25)
+                probe.close()
+            self.client = redis.Redis(
+                host=cfg.redis_host,
+                port=cfg.redis_port,
+                decode_responses=True,
+                socket_connect_timeout=0.4,
+                socket_timeout=0.4,
+                health_check_interval=0,
+            )
             self.client.ping()
         except Exception:
             self.client = None
@@ -214,11 +224,14 @@ class RedisState:
 def db_engine(cfg: Config) -> Engine | None:
     url = f"mysql+pymysql://{cfg.mysql_user}:{cfg.mysql_password}@{cfg.mysql_host}:{cfg.mysql_port}/{cfg.mysql_database}?charset=utf8mb4&connect_timeout=3"
     try:
+        if cfg.run_mode == "ui" and cfg.mysql_host in {"localhost", "127.0.0.1", "::1"}:
+            probe = socket.create_connection((cfg.mysql_host, cfg.mysql_port), timeout=0.25)
+            probe.close()
         engine = create_engine(url, pool_pre_ping=True, pool_recycle=1800)
         with engine.connect() as conn:
             conn.execute(text("SELECT 1"))
         return engine
-    except SQLAlchemyError:
+    except Exception:
         return None
 
 
@@ -496,7 +509,7 @@ def fetch_orderbook(symbol: str) -> dict[str, Any]:
         return simulated_orderbook()
 
 
-def alpha_signal(symbol: str, price: float, orderbook: dict[str, Any], cfg: Config, market_frame: pd.DataFrame | None = None) -> dict[str, Any]:
+def alpha_signal(symbol: str, price: float, orderbook: dict[str, Any], cfg: Config, market_frame: pd.DataFrame | None = None, allow_live_fetch: bool = True) -> dict[str, Any]:
     frame = market_frame if market_frame is not None and len(market_frame) >= 80 else synthetic_ohlcv(symbol, bars=180)
     indicators = add_indicators(frame)
     latest = indicators.iloc[-1] if not indicators.empty else pd.Series({"z": 0.0, "rsi": 50.0, "vol_z": 0.0, "ema20": price, "ema50": price, "taker_buy_ratio": 0.5, "adx": 99.0, "realized_vol_fast": 1.0, "realized_vol_slow": 0.0, "expected_reversion_bps": 0.0})
@@ -510,7 +523,7 @@ def alpha_signal(symbol: str, price: float, orderbook: dict[str, Any], cfg: Conf
     realized_vol_slow = float(latest.get("realized_vol_slow", 0.0))
     realized_vol_ratio = realized_vol_fast / max(realized_vol_slow, 1e-9)
     expected_reversion_bps = float(latest.get("expected_reversion_bps", 0.0))
-    htf = fetch_binance_klines(symbol, cfg.higher_timeframe_interval, limit=120)
+    htf = fetch_binance_klines(symbol, cfg.higher_timeframe_interval, limit=120) if allow_live_fetch else None
     htf_indicators = add_indicators(htf) if htf is not None and len(htf) >= 80 else pd.DataFrame()
     htf_latest = htf_indicators.iloc[-1] if not htf_indicators.empty else None
     htf_trend = 0.0 if htf_latest is None else float((htf_latest["ema20"] - htf_latest["ema50"]) / max(float(htf_latest["close"]), 1e-9))
@@ -1117,8 +1130,8 @@ def monte_carlo_summary(trades: pd.DataFrame, paths: int = 250) -> dict[str, Any
     }
 
 
-def validation_snapshot(symbol: str) -> dict[str, Any]:
-    frame = fetch_binance_klines(symbol, CFG.strategy_interval, limit=360)
+def validation_snapshot(symbol: str, allow_live_fetch: bool = True) -> dict[str, Any]:
+    frame = fetch_binance_klines(symbol, CFG.strategy_interval, limit=360) if allow_live_fetch else None
     if frame is None:
         frame = synthetic_ohlcv(symbol, bars=360)
     trades = run_backtest_for_frame(symbol, frame)
@@ -1678,12 +1691,18 @@ def color_badge(label: str, status: str, tip: str) -> str:
 def demo_rows(state: RedisState) -> list[dict[str, Any]]:
     rows = []
     for symbol in CFG.symbols:
-        price = state.get_json(f"latest_price:{symbol}") or {"price": simulated_price(symbol), "data_quality": "SIMULATED", "ts": iso_now()}
-        ob = state.get_json(f"latest_orderbook:{symbol}") or simulated_orderbook()
-        cross_state = state.get_json(f"latest_cross_exchange:{symbol}")
+        if state.ok:
+            price = state.get_json(f"latest_price:{symbol}") or {"price": simulated_price(symbol), "data_quality": "SIMULATED", "ts": iso_now()}
+            ob = state.get_json(f"latest_orderbook:{symbol}") or simulated_orderbook()
+            cross_state = state.get_json(f"latest_cross_exchange:{symbol}")
+        else:
+            price = {"price": simulated_price(symbol), "data_quality": "SIMULATED", "ts": iso_now()}
+            ob = simulated_orderbook()
+            cross_state = None
         if cross_state:
             ob["cross_exchange_spread_bps"] = cross_state["cross_exchange_spread_bps"]
-        sig = state.get_json(f"latest_signal:{symbol}") or alpha_signal(symbol, float(price["price"]), ob, CFG)
+        sig = state.get_json(f"latest_signal:{symbol}") if state.ok else None
+        sig = sig or alpha_signal(symbol, float(price["price"]), ob, CFG, allow_live_fetch=state.ok)
         rows.append(sig)
     return rows
 
@@ -1970,6 +1989,178 @@ bash scripts/horizonctl.sh performance""",
     st.info("For production, use Ubuntu 24.04 LTS, keep secrets outside GitHub, and run the backend headless with systemd.")
 
 
+def ui_status_color(status: str) -> str:
+    status = status.upper()
+    if status in {"GREEN", "OK", "ONLINE", "RUNNING", "RISK_OK", "HEALTHY", "GOOD", "PASS"}:
+        return "#22c55e"
+    if status in {"AMBER", "WARNING", "DEGRADED", "TRAINING", "WAITING"}:
+        return "#facc15"
+    return "#ef4444"
+
+
+def ui_card(title: str, value: str, subtitle: str = "", status: str = "GREEN", badge: str = "") -> str:
+    color = ui_status_color(status)
+    badge_html = f"<span class='sb-badge' style='background:{color}22;color:{color};border-color:{color}55'>{badge}</span>" if badge else ""
+    return f"""
+    <div class="sb-card">
+      <div class="sb-card-top"><span>{title}</span>{badge_html}</div>
+      <div class="sb-card-value">{value}</div>
+      <div class="sb-card-sub">{subtitle}</div>
+    </div>
+    """
+
+
+def ui_panel(title: str, body: str, extra_class: str = "") -> str:
+    return f"<div class='sb-panel {extra_class}'><div class='sb-panel-title'>{title}</div>{body}</div>"
+
+
+def plain_status(status: str) -> str:
+    return "Healthy" if status == "GREEN" else "Watch" if status == "AMBER" else "Blocked"
+
+
+def friendly_signal_reason(rows: list[dict[str, Any]], validation: dict[str, Any], risk: dict[str, Any], drift: dict[str, Any]) -> str:
+    if any(row.get("deployable") for row in rows):
+        return "A candidate passed the signal screen. Awaiting approval and final risk checks."
+    if risk.get("status") != "RISK_OK":
+        return "Risk controls are blocking new trades."
+    if drift.get("status") == "DRIFT_LOCKED":
+        return "Behavior drift is locked, so the system is pausing entries."
+    if validation["backtest"].get("total_trades", 0) < 10:
+        return "The strategy needs more validated historical trades before deployment."
+    return "No setup currently has enough edge, confidence, and risk clearance."
+
+
+def overview_alerts(rows: list[dict[str, Any]], validation: dict[str, Any], report: dict[str, Any], risk: dict[str, Any], drift: dict[str, Any]) -> list[dict[str, str]]:
+    alerts: list[dict[str, str]] = []
+    if not any(row.get("side") != "HOLD" for row in rows):
+        alerts.append({"Level": "Info", "Area": "Signals", "Message": "No active trade signal right now.", "Action": "Let scanner continue collecting setups."})
+    if validation["backtest"].get("total_trades", 0) < 10:
+        alerts.append({"Level": "High", "Area": "Validation", "Message": "Not enough backtest trades for production judgement.", "Action": "Collect more history and labeled outcomes."})
+    model = report.get("active_model") or {}
+    if not model:
+        alerts.append({"Level": "Medium", "Area": "Model", "Message": "No active trained ML model in registry.", "Action": "Allow worker-ml to gather labels and retrain."})
+    offline = [row.get("worker") for row in report.get("workers", []) if row.get("status") not in {"ONLINE", "RUNNING"}]
+    if offline:
+        alerts.append({"Level": "Medium", "Area": "Workers", "Message": f"{len(offline)} worker(s) not online.", "Action": "Check horizonctl troubleshoot logs."})
+    if risk.get("status") != "RISK_OK":
+        alerts.append({"Level": "High", "Area": "Risk", "Message": "Risk gate is locked.", "Action": "Review risk events before approving trades."})
+    if drift.get("status") != "OK":
+        alerts.append({"Level": "Medium", "Area": "Drift", "Message": "Live behavior differs from validation.", "Action": "Wait for stabilization or retrain."})
+    return alerts[:6]
+
+
+def dark_figure(fig: go.Figure, height: int = 260) -> go.Figure:
+    fig.update_layout(
+        height=height,
+        paper_bgcolor="rgba(0,0,0,0)",
+        plot_bgcolor="rgba(0,0,0,0)",
+        font=dict(color="#dbeafe", size=11),
+        margin=dict(l=18, r=16, t=28, b=24),
+        legend=dict(orientation="h", y=1.14, x=0),
+        xaxis=dict(gridcolor="rgba(148,163,184,.16)", zerolinecolor="rgba(148,163,184,.2)"),
+        yaxis=dict(gridcolor="rgba(148,163,184,.16)", zerolinecolor="rgba(148,163,184,.2)"),
+    )
+    return fig
+
+
+def model_history_rows(engine: Engine | None) -> pd.DataFrame:
+    rows = db_rows(
+        engine,
+        """SELECT version, status, trained_rows, metrics_json, trained_at
+           FROM model_registry ORDER BY trained_at ASC LIMIT 30""",
+    )
+    parsed = []
+    for row in rows:
+        metrics = {}
+        try:
+            metrics = json.loads(row.get("metrics_json") or "{}")
+        except Exception:
+            metrics = {}
+        parsed.append(
+            {
+                "trained_at": row.get("trained_at"),
+                "version": row.get("version", ""),
+                "status": row.get("status", ""),
+                "trained_rows": int(row.get("trained_rows") or 0),
+                "accuracy": float(metrics.get("accuracy", 0) or 0),
+                "precision": float(metrics.get("precision", 0) or 0),
+                "recall": float(metrics.get("recall", 0) or 0),
+            }
+        )
+    return pd.DataFrame(parsed)
+
+
+def model_learning_chart(engine: Engine | None, rows: list[dict[str, Any]]) -> go.Figure:
+    history = model_history_rows(engine)
+    fig = go.Figure()
+    if history.empty:
+        now = pd.Timestamp.utcnow()
+        confidence = max((float(row.get("ml_confidence", 0.0)) for row in rows), default=0.0)
+        history = pd.DataFrame(
+            {
+                "trained_at": [now - pd.Timedelta(hours=2), now],
+                "accuracy": [0.0, 0.0],
+                "precision": [0.0, 0.0],
+                "recall": [0.0, 0.0],
+                "trained_rows": [0, 0],
+                "confidence": [confidence, confidence],
+            }
+        )
+    else:
+        history["confidence"] = history[["accuracy", "precision", "recall"]].replace(0, np.nan).mean(axis=1).fillna(0)
+    x = history["trained_at"]
+    fig.add_trace(go.Scatter(x=x, y=history["accuracy"] * 100, mode="lines+markers", name="Accuracy", line=dict(color="#3b82f6", width=2)))
+    fig.add_trace(go.Scatter(x=x, y=history["precision"] * 100, mode="lines+markers", name="Precision", line=dict(color="#22c55e", width=2)))
+    fig.add_trace(go.Scatter(x=x, y=history["recall"] * 100, mode="lines+markers", name="Recall", line=dict(color="#e879f9", width=2)))
+    fig.add_trace(go.Scatter(x=x, y=history["confidence"] * 100, mode="lines+markers", name="Confidence", line=dict(color="#facc15", width=2)))
+    fig.update_yaxes(range=[0, 105], ticksuffix="%")
+    return dark_figure(fig, height=250)
+
+
+def training_growth_chart(engine: Engine | None) -> go.Figure:
+    feature_rows = db_rows(engine, "SELECT DATE(ts) day, COUNT(*) rows_count FROM feature_snapshots GROUP BY DATE(ts) ORDER BY day DESC LIMIT 14")
+    outcome_rows = db_rows(engine, "SELECT DATE(ts) day, COUNT(*) rows_count FROM trade_outcomes GROUP BY DATE(ts) ORDER BY day DESC LIMIT 14")
+    feature_df = pd.DataFrame(feature_rows).sort_values("day") if feature_rows else pd.DataFrame(columns=["day", "rows_count"])
+    outcome_df = pd.DataFrame(outcome_rows).sort_values("day") if outcome_rows else pd.DataFrame(columns=["day", "rows_count"])
+    if feature_df.empty and outcome_df.empty:
+        days = pd.date_range(end=pd.Timestamp.utcnow().date(), periods=7)
+        feature_df = pd.DataFrame({"day": days, "rows_count": [0] * len(days)})
+        outcome_df = pd.DataFrame({"day": days, "rows_count": [0] * len(days)})
+    fig = go.Figure()
+    fig.add_trace(go.Bar(x=feature_df["day"], y=feature_df["rows_count"], name="Feature Rows", marker_color="#3b82f6"))
+    fig.add_trace(go.Bar(x=outcome_df["day"], y=outcome_df["rows_count"], name="Labeled Outcomes", marker_color="#22c55e"))
+    fig.update_layout(barmode="group")
+    return dark_figure(fig, height=220)
+
+
+def pnl_learning_chart(engine: Engine | None, pnl: dict[str, Any]) -> go.Figure:
+    rows = db_rows(engine, "SELECT ts, equity, daily_pnl, current_dd_pct FROM pnl_snapshots ORDER BY ts ASC LIMIT 120")
+    frame = pd.DataFrame(rows)
+    if frame.empty:
+        now = pd.Timestamp.utcnow()
+        frame = pd.DataFrame({"ts": [now - pd.Timedelta(hours=1), now], "equity": [CFG.starting_equity, float(pnl.get("equity", CFG.starting_equity) or CFG.starting_equity)], "current_dd_pct": [0, float(pnl.get("current_dd_pct", 0) or 0)]})
+    fig = go.Figure()
+    fig.add_trace(go.Scatter(x=frame["ts"], y=frame["equity"], mode="lines", name="Equity", line=dict(color="#22c55e", width=2), fill="tozeroy", fillcolor="rgba(34,197,94,.18)"))
+    fig.add_trace(go.Scatter(x=frame["ts"], y=-abs(frame["current_dd_pct"].astype(float)), mode="lines", name="Drawdown %", yaxis="y2", line=dict(color="#ef4444", width=2)))
+    fig.update_layout(yaxis2=dict(overlaying="y", side="right", ticksuffix="%", gridcolor="rgba(0,0,0,0)"))
+    return dark_figure(fig, height=250)
+
+
+def signal_funnel_chart(report: dict[str, Any], rows: list[dict[str, Any]]) -> go.Figure:
+    scanned = len(rows)
+    candidates = sum(1 for row in rows if row.get("side") != "HOLD")
+    deployable = sum(1 for row in rows if row.get("deployable"))
+    pending = int(report.get("orders", {}).get("pending", 0) or 0)
+    open_positions = int(report.get("open_positions", 0) or 0)
+    fig = go.Figure(go.Funnel(y=["Scanned", "Candidates", "Risk Passed", "Queued", "Open"], x=[scanned, candidates, deployable, pending, open_positions], marker=dict(color=["#3b82f6", "#06b6d4", "#22c55e", "#facc15", "#e879f9"])))
+    return dark_figure(fig, height=230)
+
+
+def render_detail_table(st: Any, title: str, frame: pd.DataFrame) -> None:
+    st.markdown(f"<div class='sb-panel-title'>{title}</div>", unsafe_allow_html=True)
+    st.dataframe(frame, width="stretch", hide_index=True)
+
+
 def render_ui() -> None:
     import streamlit as st
 
@@ -1978,7 +2169,9 @@ def render_ui() -> None:
     init_schema(engine)
     rows = demo_rows(state)
     selected = st.session_state.get("selected_symbol", CFG.symbols[0])
-    validation = validation_snapshot(selected)
+    validation = validation_snapshot(selected, allow_live_fetch=False)
+    if state.ok and state.lock(f"lock:validation_persist:{selected}:{int(time.time() // 300)}", ttl=300):
+        persist_validation_snapshot(engine, validation)
     backtest = validation["backtest"]
     walk = validation["walk_forward"]
     monte = validation["monte_carlo"]
@@ -1987,142 +2180,323 @@ def render_ui() -> None:
     drift = state.get_json("drift_state") or {"status": "OK", "drift_score": 0, "ts": iso_now()}
     socket_status = "GREEN" if state.ok else "AMBER"
     best = max(rows, key=lambda r: abs(r["composite_score"]))
+    report = performance_report(state, engine)
+    worker_frame = worker_status_rows(state)
+    online_workers = int(worker_frame["status"].isin(["ONLINE", "RUNNING"]).sum()) if not worker_frame.empty else 0
+    total_workers = max(len(worker_frame), 1)
+    model = report.get("active_model") or {}
+    model_metrics = model.get("metrics", {}) if model else {}
+    model_conf = max((float(row.get("ml_confidence", 0.0)) for row in rows), default=0.0)
+    signals_now = sum(1 for r in rows if r.get("side") != "HOLD")
+    deploy_ready = any(bool(row.get("deployable")) for row in rows) and risk.get("status") == "RISK_OK" and drift.get("status") != "DRIFT_LOCKED" and not CFG.mean_reversion_research_only
+    validation_trades = int(backtest.get("total_trades", 0) or 0)
+    if risk.get("status") != "RISK_OK" or drift.get("status") == "DRIFT_LOCKED":
+        readiness_status = "RED"
+        readiness_title = "Blocked by Safety Controls"
+    elif validation_trades < 10 or not model:
+        readiness_status = "AMBER"
+        readiness_title = "Training Safely"
+    else:
+        readiness_status = "GREEN" if deploy_ready else "AMBER"
+        readiness_title = "Ready for Test Review" if deploy_ready else "Healthy, Waiting for Edge"
+    signal_reason = friendly_signal_reason(rows, validation, risk, drift)
 
     st.markdown(
         """
         <style>
-        .block-container{padding-top:1.2rem}
-        div[data-testid="stMetric"]{background:#f8fafc;border:1px solid #e2e8f0;border-radius:8px;padding:10px}
-        div[data-testid="stMetric"] *{color:#0f172a!important}
-        th,td{font-size:13px!important}
+        :root{--sb-bg:#070d18;--sb-panel:#101b2b;--sb-panel2:#132238;--sb-border:#24344d;--sb-text:#e5edf8;--sb-muted:#94a3b8;--sb-blue:#2563eb;--sb-green:#22c55e;--sb-yellow:#facc15;--sb-red:#ef4444}
+        .stApp{background:radial-gradient(circle at top left,#0b1f36 0,#070d18 36%,#050913 100%);color:var(--sb-text)}
+        .block-container{padding-top:1.2rem;padding-bottom:1.2rem;max-width:1700px}
+        section[data-testid="stSidebar"]{background:linear-gradient(180deg,#0c1728,#07111f);border-right:1px solid #1e293b}
+        section[data-testid="stSidebar"] *{color:#dbeafe}
+        div[data-testid="stRadio"] label{padding:.42rem .55rem;border-radius:8px}
+        div[data-testid="stRadio"] label:has(input:checked){background:#0f3b83}
+        h1,h2,h3{letter-spacing:0;color:#f8fafc}
+        p,span,div{letter-spacing:0}
+        .sb-brand{display:flex;gap:.75rem;align-items:center;margin:.4rem 0 1.2rem}
+        .sb-logo{width:34px;height:34px;border-radius:8px;background:#facc15;color:#0f172a;font-weight:900;display:flex;align-items:center;justify-content:center}
+        .sb-brand-title{font-weight:800;font-size:1.05rem}
+        .sb-brand-sub{color:#94a3b8;font-size:.78rem}
+        .sb-hero{border:1px solid #24344d;background:linear-gradient(135deg,rgba(37,99,235,.18),rgba(34,197,94,.08));border-radius:8px;padding:14px 16px;margin:.4rem 0 1rem}
+        .sb-hero-row{display:flex;align-items:center;justify-content:space-between;gap:14px}
+        .sb-hero-title{font-size:1.15rem;font-weight:800}
+        .sb-hero-sub{color:#b6c6dc;font-size:.88rem;margin-top:3px}
+        .sb-dot{display:inline-block;width:9px;height:9px;border-radius:50%;margin-right:7px}
+        .sb-card,.sb-panel{border:1px solid #24344d;background:linear-gradient(180deg,rgba(19,34,56,.95),rgba(12,24,40,.95));border-radius:8px;box-shadow:0 12px 30px rgba(0,0,0,.18)}
+        .sb-card{min-height:96px;padding:14px 14px}
+        .sb-card-top{display:flex;align-items:center;justify-content:space-between;color:#b6c6dc;font-size:.82rem}
+        .sb-card-value{font-size:1.72rem;font-weight:800;color:#f8fafc;margin-top:7px;line-height:1.05}
+        .sb-card-sub{font-size:.78rem;color:#94a3b8;margin-top:7px;line-height:1.25}
+        .sb-badge{border:1px solid;border-radius:6px;padding:2px 7px;font-size:.72rem;font-weight:800}
+        .sb-panel{padding:14px;margin-bottom:.8rem}
+        .sb-panel-title{font-weight:800;color:#f8fafc;margin-bottom:10px}
+        .sb-small{font-size:.78rem;color:#94a3b8}
+        .sb-health-row{display:grid;grid-template-columns:22px 1fr auto;gap:10px;align-items:center;border:1px solid #263750;border-radius:8px;padding:9px 10px;margin:7px 0;background:rgba(15,23,42,.45)}
+        .sb-health-title{font-weight:700;color:#f8fafc}
+        .sb-health-sub{font-size:.76rem;color:#94a3b8}
+        .sb-side-box{border:1px solid #24344d;background:#101b2b;border-radius:8px;padding:12px;margin:.7rem 0}
+        .sb-side-title{font-size:.8rem;color:#94a3b8}
+        .sb-side-value{font-weight:800;color:#f8fafc;margin-top:3px}
+        div[data-testid="stMetric"]{background:#101b2b;border:1px solid #24344d;border-radius:8px;padding:10px}
+        div[data-testid="stMetric"] *{color:#e5edf8!important}
+        div[data-testid="stDataFrame"]{border:1px solid #24344d;border-radius:8px;overflow:hidden}
+        th,td{font-size:12px!important}
+        .stButton button{border-radius:8px;border:1px solid #2b4c7e;background:#12356a;color:#eff6ff}
+        .stButton button:hover{border-color:#60a5fa;color:white}
         </style>
         """,
         unsafe_allow_html=True,
     )
     with st.sidebar:
-        st.title("Superbot")
-        page = st.radio("View", ["Trading Dashboard", "Home"], index=0)
-        st.caption("Backend workers can run headless; this UI only renders current state, validation, and controls.")
+        st.markdown(
+            """
+            <div class="sb-brand">
+              <div class="sb-logo">B</div>
+              <div><div class="sb-brand-title">HORIZON LAB</div><div class="sb-brand-sub">Crypto Mispricing Lab</div></div>
+            </div>
+            """,
+            unsafe_allow_html=True,
+        )
+        page = st.radio(
+            "View",
+            ["Overview", "System Health", "Signals", "Performance", "Model Learning", "Trades", "Risk Monitor", "Funding & PnL", "Scanners", "Alerts", "Reports", "Settings", "Home"],
+            index=0,
+        )
+        st.markdown(
+            f"""
+            <div class="sb-side-box"><div class="sb-side-title">System Status</div><div class="sb-side-value"><span class="sb-dot" style="background:{ui_status_color(readiness_status)}"></span>{plain_status(readiness_status)}</div><div class="sb-small">{readiness_title}</div></div>
+            <div class="sb-side-box"><div class="sb-side-title">Workers</div><div class="sb-side-value">{online_workers}/{total_workers} online</div><div class="sb-small">Backend runs headless</div></div>
+            """,
+            unsafe_allow_html=True,
+        )
     if page == "Home":
         render_home_page(st)
         return
 
-    st.title("Horizon Institutional Crypto Mispricing Lab")
-    st.caption(f"Feasibility, validation, risk gating, and paper deployment. Stage={CFG.system_stage}. Spot Testnet orders require credentials and remain manually gated.")
-
-    top = st.container()
-    with top:
-        c = st.columns(6)
-        c[0].markdown(color_badge("Socket", socket_status, "Redis connection health for live dashboard refresh."), unsafe_allow_html=True)
-        c[1].markdown(color_badge("Data", "GREEN" if any(r["price"] for r in rows) else "RED", "Fresh latest-state market data availability."), unsafe_allow_html=True)
-        c[2].markdown(color_badge("Risk", risk.get("status", "RISK_OK"), "Risk gate status controlling deployment."), unsafe_allow_html=True)
-        c[3].markdown(color_badge("Drift", "RED" if drift.get("status") == "DRIFT_LOCKED" else "AMBER" if drift.get("status") == "WARNING" else "GREEN", "Live-vs-backtest drift state blocks deployment when locked."), unsafe_allow_html=True)
-        c[4].write(f"Time: `{datetime.now().strftime('%H:%M:%S')}`")
-        c[5].write("Latency: `local`")
-
-    m = st.columns(10)
-    metrics = [
-        ("Horizon Score", f"{best['composite_score']:.2f}", "Composite alpha score across mispricing factors."),
-        ("Signals Now", str(sum(1 for r in rows if r["side"] != "HOLD")), "Current non-HOLD signals."),
-        ("Backtest Trades", str(backtest["total_trades"]), "Most recent same-logic backtest trade count."),
-        ("Win Rate", f"{backtest['win_rate']:.1%}", "Backtested win probability."),
-        ("Max DD", f"{backtest['max_drawdown']:.1%}", "Maximum drawdown from validation sample."),
-        ("Live P&L", f"${pnl['daily_pnl']:,.0f}", "Current paper daily P&L."),
-        ("OBI", f"{best['obi']:.2f}", "Order-book imbalance: bid minus ask volume over total volume."),
-        ("Funding", f"{best['funding_pressure']:.2f}", "Funding pressure and crowding proxy."),
-        ("Spread", f"{best['cross_exchange_spread_bps']:.1f} bps", "Cross-venue or fallback divergence proxy."),
-        ("Drift", f"{drift.get('drift_score', 0):.0f}/100", "Live-vs-backtest behavior drift score."),
-    ]
-    for col, (label, value, help_text) in zip(m, metrics):
-        col.metric(label, value, help=help_text)
-
-    stages = ["Ingest", "CLOB Snap", "Replay", "Backtest", "Validate", "Approve", "Deploy", "Monitor"]
-    st.markdown(" ".join(color_badge(stage, "GREEN" if i < 5 else "AMBER", f"{stage} lifecycle gate") for i, stage in enumerate(stages)), unsafe_allow_html=True)
-
-    st.subheader("Production Progress")
-    st.plotly_chart(production_progress_chart(state, rows, validation, risk, drift), width="stretch")
-
     df = pd.DataFrame(rows)
     scanner_cols = ["symbol", "candidate_side", "side", "price", "strategy_interval", "z_score", "rsi", "volume_z", "adx", "expected_reversion_bps", "ml_confidence", "ml_model_version", "obi", "cross_exchange_spread_bps", "model_slippage_bps", "funding_pressure", "open_interest_signal", "win_p_est", "payoff_b", "kelly_fraction", "suggested_usdt", "research_only", "deployable", "deployment_blockers", "rationale"]
-    st.subheader("Scanner")
-    st.dataframe(df[scanner_cols], width="stretch", hide_index=True)
+    alerts = overview_alerts(rows, validation, report, risk, drift)
 
-    selected = st.selectbox("Replay Symbol", CFG.symbols, key="selected_symbol")
-    validation = validation_snapshot(selected)
-    if state.ok and state.lock(f"lock:validation_persist:{selected}:{int(time.time() // 300)}", ttl=300):
-        persist_validation_snapshot(engine, validation)
-    backtest = validation["backtest"]
-    walk = validation["walk_forward"]
-    monte = validation["monte_carlo"]
-    left, right = st.columns([1.7, 1])
-    with left:
+    header_left, header_right = st.columns([2.4, 1])
+    with header_left:
+        st.title("Horizon Institutional Crypto Mispricing Lab")
+        st.caption("AI-powered mispricing detection, risk-managed execution, and continuous learning.")
+    with header_right:
+        h1, h2, h3 = st.columns(3)
+        h1.markdown(ui_card("Environment", CFG.system_stage.title(), "Current operating mode", "GREEN" if CFG.system_stage == "production" else "AMBER"), unsafe_allow_html=True)
+        h2.markdown(ui_card("Time (IST)", datetime.now().strftime("%H:%M:%S"), "Dashboard refresh", "GREEN"), unsafe_allow_html=True)
+        h3.markdown(ui_card("Latency", "Local", "UI render path", socket_status), unsafe_allow_html=True)
+
+    st.markdown(
+        f"""
+        <div class="sb-hero">
+          <div class="sb-hero-row">
+            <div><div class="sb-hero-title"><span class="sb-dot" style="background:{ui_status_color(readiness_status)}"></span>{readiness_title}</div><div class="sb-hero-sub">{signal_reason}</div></div>
+            <div class="sb-badge" style="background:{ui_status_color(readiness_status)}22;color:{ui_status_color(readiness_status)};border-color:{ui_status_color(readiness_status)}55">Deploy Ready: {'Yes' if deploy_ready else 'No'}</div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    if page == "Overview":
+        st.markdown("<div class='sb-panel-title'>At a Glance</div>", unsafe_allow_html=True)
+        card_cols = st.columns(7)
+        win_text = "Need data" if validation_trades < 10 else f"{backtest['win_rate']:.2%}"
+        card_specs = [
+            ("Trade Opportunity", f"{best['composite_score']:.2f}", "Weak" if abs(best["composite_score"]) < 1 else "Strong setup", "AMBER" if abs(best["composite_score"]) < 1 else "GREEN", "Low" if abs(best["composite_score"]) < 1 else "High"),
+            ("Active Signals", str(signals_now), "No active signals" if signals_now == 0 else "Review candidates", "AMBER" if signals_now == 0 else "GREEN", ""),
+            ("Win Rate", win_text, f"{validation_trades} validated trades", "AMBER" if validation_trades < 10 else "GREEN", ""),
+            ("Live P&L", f"${float(pnl.get('daily_pnl', 0) or 0):,.0f}", "Today / paper", "GREEN" if float(pnl.get("daily_pnl", 0) or 0) >= 0 else "RED", ""),
+            ("Market Crowding", f"{best['funding_pressure']:.2f}", "Funding pressure", "AMBER" if abs(best["funding_pressure"]) > 0.4 else "GREEN", ""),
+            ("Price Gap", f"{best['cross_exchange_spread_bps']:.1f} bps", "Cross-exchange", "GREEN" if abs(best["cross_exchange_spread_bps"]) >= 5 else "AMBER", ""),
+            ("Behavior Change", f"{float(drift.get('drift_score', 0) or 0):.0f}/100", "Drift budget used", "GREEN" if drift.get("status") == "OK" else "AMBER", ""),
+        ]
+        for col, spec in zip(card_cols, card_specs):
+            col.markdown(ui_card(*spec), unsafe_allow_html=True)
+
+        left, mid, right = st.columns([1.05, 1.35, .72])
+        with left:
+            health_rows = [
+                ("Data Ingestion", "Market feeds available" if any(r["price"] for r in rows) else "No market feed", "GREEN" if any(r["price"] for r in rows) else "RED"),
+                ("Model & Signals", "Model active" if model else "Learning or fallback mode", "GREEN" if model else "AMBER"),
+                ("Execution", "No order issues", "GREEN"),
+                ("Risk Controls", risk.get("status", "UNKNOWN"), "GREEN" if risk.get("status") == "RISK_OK" else "RED"),
+                ("Infrastructure", f"{online_workers}/{total_workers} workers online", "GREEN" if online_workers == total_workers else "AMBER"),
+            ]
+            body = "".join(
+                f"<div class='sb-health-row'><span class='sb-dot' style='background:{ui_status_color(status)}'></span><div><div class='sb-health-title'>{name}</div><div class='sb-health-sub'>{sub}</div></div><div class='sb-small'>{plain_status(status)}</div></div>"
+                for name, sub, status in health_rows
+            )
+            body += f"<div class='sb-side-box'><div class='sb-side-title'>Overall Status</div><div class='sb-side-value' style='color:{ui_status_color(readiness_status)}'>{plain_status(readiness_status)}</div><div class='sb-small'>Last update {datetime.now().strftime('%H:%M:%S')}</div></div>"
+            st.markdown(ui_panel("System Health", body), unsafe_allow_html=True)
+        with mid:
+            st.markdown("<div class='sb-panel'><div class='sb-panel-title'>Production Progress</div>", unsafe_allow_html=True)
+            st.plotly_chart(dark_figure(production_progress_chart(state, rows, validation, risk, drift), height=275), width="stretch")
+            st.markdown("</div>", unsafe_allow_html=True)
+        with right:
+            perf_body = f"""
+            <div class='sb-small'>Trading Performance</div>
+            <div class='sb-health-row'><div></div><div>Backtest Trades</div><b>{validation_trades}</b></div>
+            <div class='sb-health-row'><div></div><div>Expected Profit / Trade</div><b>{backtest['expectancy'] * 10000:.1f} bps</b></div>
+            <div class='sb-health-row'><div></div><div>Profit Factor</div><b>{backtest['profit_factor']:.2f}</b></div>
+            <div class='sb-small' style='margin-top:10px'>Model Metrics</div>
+            <div class='sb-health-row'><div></div><div>Model Confidence</div><b>{model_conf:.2f}</b></div>
+            <div class='sb-health-row'><div></div><div>Training Rows</div><b>{model.get('trained_rows', 0) if model else 0}</b></div>
+            <div class='sb-health-row'><div></div><div>Accuracy</div><b>{float(model_metrics.get('accuracy', 0) or 0):.2%}</b></div>
+            """
+            st.markdown(ui_panel("Key Metrics", perf_body), unsafe_allow_html=True)
+
+        learn_left, learn_right = st.columns([1.05, 1.25])
+        with learn_left:
+            body = f"""
+            <div class='sb-health-row'><span class='sb-dot' style='background:{ui_status_color('GREEN' if model else 'AMBER')}'></span><div><div class='sb-health-title'>Active Model</div><div class='sb-health-sub'>{model.get('version', 'No trained model yet')}</div></div><b>{model.get('status', 'WAITING')}</b></div>
+            <div class='sb-health-row'><span class='sb-dot' style='background:{ui_status_color('GREEN' if model_conf >= CFG.min_ml_confidence else 'AMBER')}'></span><div><div class='sb-health-title'>Entry Confidence</div><div class='sb-health-sub'>Minimum target {CFG.min_ml_confidence:.2f}</div></div><b>{model_conf:.2f}</b></div>
+            <div class='sb-health-row'><span class='sb-dot' style='background:{ui_status_color('GREEN' if validation_trades >= 10 else 'AMBER')}'></span><div><div class='sb-health-title'>Learning Evidence</div><div class='sb-health-sub'>Validated trades and labels</div></div><b>{validation_trades}</b></div>
+            """
+            st.markdown(ui_panel("Model Learning", body), unsafe_allow_html=True)
+            st.plotly_chart(training_growth_chart(engine), width="stretch")
+        with learn_right:
+            st.markdown("<div class='sb-panel'><div class='sb-panel-title'>Model Performance Over Time</div>", unsafe_allow_html=True)
+            st.plotly_chart(model_learning_chart(engine, rows), width="stretch")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        pnl_left, pnl_right = st.columns([1.1, 1])
+        with pnl_left:
+            st.markdown("<div class='sb-panel'><div class='sb-panel-title'>P&L and Drawdown</div>", unsafe_allow_html=True)
+            st.plotly_chart(pnl_learning_chart(engine, pnl), width="stretch")
+            st.markdown("</div>", unsafe_allow_html=True)
+        with pnl_right:
+            st.markdown("<div class='sb-panel'><div class='sb-panel-title'>Signal Lifecycle Funnel</div>", unsafe_allow_html=True)
+            st.plotly_chart(signal_funnel_chart(report, rows), width="stretch")
+            st.markdown("</div>", unsafe_allow_html=True)
+
+        act_left, act_right = st.columns([1.05, 1])
+        with act_left:
+            render_detail_table(st, "Recent Activity", audit_rows(engine).head(6))
+        with act_right:
+            render_detail_table(st, "Alerts and Next Actions", pd.DataFrame(alerts))
+
+    elif page == "System Health":
+        st.subheader("System Health")
+        render_detail_table(st, "Worker Status", worker_frame)
+        render_detail_table(st, "Audit", audit_rows(engine))
+        st.plotly_chart(signal_funnel_chart(report, rows), width="stretch")
+
+    elif page == "Signals":
+        st.subheader("Signals")
+        st.markdown(f"Current interpretation: **{signal_reason}**")
+        render_detail_table(st, "Latest Scanner Signals", df[scanner_cols])
         st.plotly_chart(historical_chart(selected), width="stretch")
-    with right:
-        st.subheader("Validation")
-        st.markdown(color_badge("Walk-forward", walk["status"], f"Train expectancy {walk['train_perf']:.4f}; test expectancy {walk['test_perf']:.4f}; degradation {walk['degradation_pct']:.1f}%."), unsafe_allow_html=True)
-        st.markdown(color_badge("Monte Carlo", monte["status"], f"DD breach probability {monte['prob_dd_breach']:.1%}; ruin probability {monte['prob_ruin']:.1%}."), unsafe_allow_html=True)
-        st.markdown(color_badge("Drift", "GREEN" if drift.get("status") == "OK" else "AMBER" if drift.get("status") == "WARNING" else "RED", "Live metrics within modeled range."), unsafe_allow_html=True)
-        st.metric("Profit Factor", f"{backtest['profit_factor']:.2f}" if np.isfinite(backtest["profit_factor"]) else "inf")
-        st.metric("Expectancy", f"{backtest['expectancy']:.4f}")
-        approval = st.checkbox("Manual approval for paper deployment")
+
+    elif page == "Performance":
+        st.subheader("Performance")
+        perf_cols = st.columns(5)
+        for col, (label, value) in zip(
+            perf_cols,
+            [
+                ("Backtest Trades", str(validation_trades)),
+                ("Win Rate", "Need data" if validation_trades < 10 else f"{backtest['win_rate']:.2%}"),
+                ("Profit Factor", f"{backtest['profit_factor']:.2f}"),
+                ("Expectancy", f"{backtest['expectancy'] * 10000:.1f} bps"),
+                ("Max Drawdown", f"{abs(backtest['max_drawdown']) * 100:.2f}%"),
+            ],
+        ):
+            col.markdown(ui_card(label, value, "Strategy validation", "AMBER" if validation_trades < 10 else "GREEN"), unsafe_allow_html=True)
+        st.plotly_chart(pnl_learning_chart(engine, pnl), width="stretch")
+        st.plotly_chart(dark_figure(production_progress_chart(state, rows, validation, risk, drift), height=300), width="stretch")
+
+    elif page == "Model Learning":
+        st.subheader("Model Learning")
+        st.markdown("This page shows whether the model is collecting data, retraining, and improving enough to trust its entry confidence.")
+        c1, c2, c3, c4 = st.columns(4)
+        c1.markdown(ui_card("Active Version", model.get("version", "None"), "Model registry", "GREEN" if model else "AMBER"), unsafe_allow_html=True)
+        c2.markdown(ui_card("Training Rows", str(model.get("trained_rows", 0) if model else 0), "Rows used in latest model", "GREEN" if model else "AMBER"), unsafe_allow_html=True)
+        c3.markdown(ui_card("Accuracy", f"{float(model_metrics.get('accuracy', 0) or 0):.2%}", "Latest promoted model", "GREEN" if float(model_metrics.get("accuracy", 0) or 0) >= CFG.ml_min_accuracy else "AMBER"), unsafe_allow_html=True)
+        c4.markdown(ui_card("Confidence Gate", f"{model_conf:.2f}", f"Target {CFG.min_ml_confidence:.2f}", "GREEN" if model_conf >= CFG.min_ml_confidence else "AMBER"), unsafe_allow_html=True)
+        l1, l2 = st.columns(2)
+        with l1:
+            st.plotly_chart(model_learning_chart(engine, rows), width="stretch")
+        with l2:
+            st.plotly_chart(training_growth_chart(engine), width="stretch")
+        render_detail_table(st, "Model Registry History", model_history_rows(engine))
+
+    elif page == "Trades":
+        st.subheader("Trades and Deployment")
+        selected = st.selectbox("Replay Symbol", CFG.symbols, key="selected_symbol_trades")
         candidate = next((r for r in rows if r["symbol"] == selected), rows[0])
+        approval = st.checkbox("Manual approval for paper deployment")
         can_deploy = approval and candidate["deployable"] and validation["validation_status"] == "GREEN" and risk.get("status") == "RISK_OK" and drift.get("status") != "DRIFT_LOCKED"
+        deploy_cols = st.columns(3)
+        deploy_cols[0].markdown(ui_card("Selected Symbol", selected, candidate.get("side", "HOLD"), "GREEN" if candidate.get("deployable") else "AMBER"), unsafe_allow_html=True)
+        deploy_cols[1].markdown(ui_card("Suggested Size", f"${float(candidate.get('suggested_usdt', 0)):,.0f}", "Risk capped", "GREEN"), unsafe_allow_html=True)
+        deploy_cols[2].markdown(ui_card("Deploy Gate", "Open" if can_deploy else "Closed", "Needs signal, validation, approval", "GREEN" if can_deploy else "AMBER"), unsafe_allow_html=True)
         if st.button("Deploy Paper Position", disabled=not can_deploy):
             request_key = f"deploy:paper:{candidate['symbol']}:{int(time.time())}:{uuid4().hex[:8]}"
-            request_payload = {**candidate, "manual_approval": True, "requested_at": iso_now(), "requested_by": "human", "validation_status": validation["validation_status"], "backtest": {k: v for k, v in backtest.items() if k != "equity_curve"}, "walk_forward": walk, "monte_carlo": {k: v for k, v in monte.items() if k != "worst_path"}}
+            request_payload = {**candidate, "manual_approval": True, "requested_at": iso_now(), "requested_by": "human", "validation_status": validation["validation_status"]}
             db_execute(
                 engine,
                 """INSERT IGNORE INTO deployment_requests(idempotency_key, signal_key, symbol, side, requested_size_usdt, requested_price, mode, status, requested_by, request_json, created_at)
                    VALUES(:key, :signal_key, :symbol, :side, :size, :price, 'PAPER', 'PENDING', 'human', :payload, :ts)""",
-                {
-                    "key": request_key,
-                    "signal_key": candidate.get("idempotency_key", ""),
-                    "symbol": candidate["symbol"],
-                    "side": candidate["side"],
-                    "size": candidate["suggested_usdt"],
-                    "price": candidate["price"],
-                    "payload": json.dumps(request_payload),
-                    "ts": now_utc().replace(tzinfo=None),
-                },
-            )
-            db_execute(
-                engine,
-                "INSERT INTO audit_log(event_type, actor, symbol, message, metadata_json, ts) VALUES('DEPLOYMENT_REQUESTED', 'human', :symbol, :message, :meta, :ts)",
-                {"symbol": candidate["symbol"], "message": "Manual paper deployment request queued for worker-order.", "meta": json.dumps(request_payload), "ts": now_utc().replace(tzinfo=None)},
+                {"key": request_key, "signal_key": candidate.get("idempotency_key", ""), "symbol": candidate["symbol"], "side": candidate["side"], "size": candidate["suggested_usdt"], "price": candidate["price"], "payload": json.dumps(request_payload), "ts": now_utc().replace(tzinfo=None)},
             )
             state.set_json("latest_deployment_request", {"idempotency_key": request_key, **request_payload}, ex=600)
-            state.push_json("deployment_requests", {"idempotency_key": request_key, **request_payload})
-            state.publish_audit({"event_type": "DEPLOYMENT_REQUESTED", "symbol": candidate["symbol"], "idempotency_key": request_key, "ts": iso_now()})
             st.success("Deployment request queued. worker-order will re-check risk and create the paper order.")
-        st.checkbox("Enable real Spot Testnet order confirmation", disabled=not CFG.enable_real_testnet_orders, help="Requires Binance Spot Testnet credentials. Enabled by default for testnet only.")
+        st.checkbox("Enable real Spot Testnet order confirmation", disabled=not CFG.enable_real_testnet_orders)
         st.button("Place Tiny Testnet Order", disabled=not (CFG.enable_real_testnet_orders and testnet_credentials_present() and can_deploy))
+        render_detail_table(st, "Deployment Queue", deployment_queue_rows(engine))
+        render_detail_table(st, "Recent Positions", pd.DataFrame(report.get("positions", [])))
 
-    st.subheader("Robustness Matrix")
-    tf = ["5m", "15m", "30m", "1h", "4h", "1d", "AVG"]
-    matrix_rows = []
-    for symbol in CFG.symbols:
-        snap = validation_snapshot(symbol)
-        win = snap["backtest"]["win_rate"]
-        status = "GREEN" if win >= 0.55 else "AMBER" if win >= 0.45 else "RED"
-        matrix_rows.append({**{"symbol": symbol}, **{t: status for t in tf[:-1]}, "AVG": f"{win:.1%}"})
-    matrix = pd.DataFrame(matrix_rows)
-    st.dataframe(matrix, width="stretch", hide_index=True)
+    elif page == "Risk Monitor":
+        st.subheader("Risk Monitor")
+        c1, c2, c3 = st.columns(3)
+        c1.markdown(ui_card("Risk State", risk.get("status", "UNKNOWN"), "Deployment safety gate", "GREEN" if risk.get("status") == "RISK_OK" else "RED"), unsafe_allow_html=True)
+        c2.markdown(ui_card("Drift State", drift.get("status", "UNKNOWN"), f"Score {float(drift.get('drift_score', 0) or 0):.0f}/100", "GREEN" if drift.get("status") == "OK" else "AMBER"), unsafe_allow_html=True)
+        c3.markdown(ui_card("Current DD", f"{float(pnl.get('current_dd_pct', 0) or 0):.2f}%", "Portfolio drawdown", "GREEN" if float(pnl.get("current_dd_pct", 0) or 0) <= CFG.max_portfolio_dd_pct else "RED"), unsafe_allow_html=True)
+        render_detail_table(st, "Alerts", pd.DataFrame(alerts))
 
-    p = st.columns(6)
-    for col, (label, key) in zip(p, [("Realized P&L", "realized_pnl"), ("Unrealized P&L", "unrealized_pnl"), ("Daily P&L", "daily_pnl"), ("Equity", "equity"), ("Current DD", "current_dd_pct"), ("Agent", "agent")]):
-        value = "ONLINE" if key == "agent" else f"${pnl[key]:,.0f}" if "pnl" in key or key == "equity" else f"{pnl[key]:.2f}%"
-        col.metric(label, value)
+    elif page == "Funding & PnL":
+        st.subheader("Funding and P&L")
+        p = st.columns(5)
+        for col, (label, value, status) in zip(
+            p,
+            [
+                ("Realized P&L", f"${float(pnl.get('realized_pnl', 0) or 0):,.0f}", "GREEN"),
+                ("Unrealized P&L", f"${float(pnl.get('unrealized_pnl', 0) or 0):,.0f}", "GREEN"),
+                ("Daily P&L", f"${float(pnl.get('daily_pnl', 0) or 0):,.0f}", "GREEN" if float(pnl.get("daily_pnl", 0) or 0) >= 0 else "RED"),
+                ("Equity", f"${float(pnl.get('equity', CFG.starting_equity) or CFG.starting_equity):,.0f}", "GREEN"),
+                ("Funding Pressure", f"{best['funding_pressure']:.2f}", "AMBER" if abs(best["funding_pressure"]) > 0.4 else "GREEN"),
+            ],
+        ):
+            col.markdown(ui_card(label, value, "Latest state", status), unsafe_allow_html=True)
+        st.plotly_chart(pnl_learning_chart(engine, pnl), width="stretch")
 
-    q_left, q_right = st.columns([1.2, 1])
-    with q_left:
-        st.subheader("Deployment Queue")
-        st.dataframe(deployment_queue_rows(engine), width="stretch", hide_index=True)
-    with q_right:
-        st.subheader("Worker Status")
-        st.dataframe(worker_status_rows(state), width="stretch", hide_index=True)
+    elif page == "Scanners":
+        st.subheader("Scanners")
+        render_detail_table(st, "Market Scanner", df[scanner_cols])
 
-    st.subheader("Audit")
-    st.dataframe(audit_rows(engine), width="stretch", hide_index=True)
+    elif page == "Alerts":
+        st.subheader("Alerts")
+        render_detail_table(st, "Alerts and Recommended Actions", pd.DataFrame(alerts))
+        render_detail_table(st, "Audit", audit_rows(engine))
+
+    elif page == "Reports":
+        st.subheader("Reports")
+        st.json(report)
+
+    elif page == "Settings":
+        st.subheader("Settings")
+        settings = pd.DataFrame(
+            [
+                {"Setting": "SYSTEM_STAGE", "Value": CFG.system_stage, "Meaning": "Training, testnet, or production operating stage"},
+                {"Setting": "ENABLE_REAL_TESTNET_ORDERS", "Value": str(CFG.enable_real_testnet_orders), "Meaning": "Whether tiny Spot Testnet orders are allowed"},
+                {"Setting": "MEAN_REVERSION_RESEARCH_ONLY", "Value": str(CFG.mean_reversion_research_only), "Meaning": "Blocks production deployment when true"},
+                {"Setting": "MIN_ML_CONFIDENCE", "Value": f"{CFG.min_ml_confidence:.2f}", "Meaning": "Minimum model confidence before deployment"},
+                {"Setting": "MAX_POSITION_USDT", "Value": f"{CFG.max_position_usdt:.0f}", "Meaning": "Maximum position size"},
+            ]
+        )
+        render_detail_table(st, "Runtime Settings", settings)
+
     st.caption(f"pipeline_time=local | cost_per_hypothesis=paper | deploy_rate=manual | pid={os.getpid()} | seed=dynamic | runtime={CFG.run_mode}")
 
 
