@@ -152,7 +152,13 @@ def build_report() -> dict[str, Any]:
         "validation": query_rows(conn, "SELECT symbol, status, total_trades, win_rate, profit_factor, expectancy, max_drawdown, updated_at FROM validation_state ORDER BY updated_at DESC LIMIT 10"),
         "recent_handoffs": query_rows(conn, "SELECT created_at, stage, symbol, status, next_owner, reason FROM handoff_events ORDER BY id DESC LIMIT 12"),
         "recent_orders": query_rows(conn, "SELECT created_at, symbol, side, mode, status, requested_size_usdt, block_reason FROM deployment_requests ORDER BY id DESC LIMIT 10"),
-        "positions": query_rows(conn, "SELECT symbol, side, entry_price, current_price, size_usdt, unrealized_pnl, realized_pnl, status, updated_at FROM positions ORDER BY id DESC LIMIT 10"),
+        "positions": query_rows(
+            conn,
+            """SELECT symbol, side, COALESCE(venue, 'PAPER') AS venue, entry_price, current_price, size_usdt,
+                      unrealized_pnl, (COALESCE(unrealized_pnl, 0) / GREATEST(COALESCE(size_usdt, 0), 0.000000001)) * 10000 AS unrealized_bps,
+                      realized_pnl, status, updated_at
+               FROM positions ORDER BY id DESC LIMIT 10""",
+        ),
     }
     if conn is not None:
         conn.close()

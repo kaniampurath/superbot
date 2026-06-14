@@ -107,6 +107,39 @@ def format_profit_factor(value: Any) -> str:
     return f"{profit_factor:.2f}"
 
 
+def format_money(value: Any, decimals: int = 2) -> str:
+    try:
+        amount = float(value)
+    except (TypeError, ValueError):
+        amount = 0.0
+    return f"${amount:,.{decimals}f}"
+
+
+def pnl_status(value: Any) -> str:
+    try:
+        return "GREEN" if float(value) >= 0 else "RED"
+    except (TypeError, ValueError):
+        return "AMBER"
+
+
+def interval_to_seconds(interval: str) -> int:
+    text_value = str(interval or "1m").strip().lower()
+    try:
+        amount = int(text_value[:-1])
+    except ValueError:
+        return 60
+    suffix = text_value[-1:]
+    if suffix == "m":
+        return amount * 60
+    if suffix == "h":
+        return amount * 3600
+    if suffix == "d":
+        return amount * 86400
+    if suffix == "s":
+        return amount
+    return 60
+
+
 def json_safe(value: Any) -> Any:
     if isinstance(value, dict):
         return {str(key): json_safe(item) for key, item in value.items()}
@@ -247,6 +280,11 @@ def place_binance_spot_testnet_order(symbol: str, side: str, price: float, size_
 class RedisState:
     def __init__(self, cfg: Config):
         self.client = None
+        self.cfg = cfg
+        self.connect()
+
+    def connect(self) -> None:
+        cfg = self.cfg
         if redis is None:
             return
         try:
@@ -270,13 +308,24 @@ class RedisState:
         return self.client is not None
 
     def set_json(self, key: str, value: dict[str, Any], ex: int | None = None) -> None:
+        if not self.client:
+            self.connect()
         if self.client:
-            self.client.set(key, json.dumps(value, default=str), ex=ex)
+            try:
+                self.client.set(key, json.dumps(value, default=str), ex=ex)
+            except Exception:
+                self.client = None
 
     def get_json(self, key: str) -> dict[str, Any] | None:
         if not self.client:
+            self.connect()
+        if not self.client:
             return None
-        value = self.client.get(key)
+        try:
+            value = self.client.get(key)
+        except Exception:
+            self.client = None
+            return None
         if not value:
             return None
         try:
@@ -285,21 +334,37 @@ class RedisState:
             return None
 
     def publish(self, channel: str, value: dict[str, Any]) -> None:
+        if not self.client:
+            self.connect()
         if self.client:
-            self.client.publish(channel, json.dumps(value, default=str))
+            try:
+                self.client.publish(channel, json.dumps(value, default=str))
+            except Exception:
+                self.client = None
 
     def publish_audit(self, value: dict[str, Any]) -> None:
         self.publish("audit_events", value)
         self.publish("audit_updates", value)
 
     def push_json(self, key: str, value: dict[str, Any]) -> None:
+        if not self.client:
+            self.connect()
         if self.client:
-            self.client.lpush(key, json.dumps(value, default=str))
+            try:
+                self.client.lpush(key, json.dumps(value, default=str))
+            except Exception:
+                self.client = None
 
     def lock(self, key: str, ttl: int) -> bool:
         if not self.client:
+            self.connect()
+        if not self.client:
             return True
-        return bool(self.client.set(key, "1", nx=True, ex=ttl))
+        try:
+            return bool(self.client.set(key, "1", nx=True, ex=ttl))
+        except Exception:
+            self.client = None
+            return True
 
 
 def db_engine(cfg: Config) -> Engine | None:
@@ -328,7 +393,7 @@ SCHEMA_SQL = [
     """CREATE TABLE IF NOT EXISTS paper_orders (id BIGINT PRIMARY KEY AUTO_INCREMENT, idempotency_key VARCHAR(160) UNIQUE, signal_id BIGINT, symbol VARCHAR(24), side VARCHAR(8), size_usdt DOUBLE, status VARCHAR(30), created_at DATETIME(6))""",
     """CREATE TABLE IF NOT EXISTS testnet_orders (id BIGINT PRIMARY KEY AUTO_INCREMENT, idempotency_key VARCHAR(160) UNIQUE, signal_id BIGINT, symbol VARCHAR(24), side VARCHAR(8), size_usdt DOUBLE, status VARCHAR(30), created_at DATETIME(6))""",
     """CREATE TABLE IF NOT EXISTS executions (id BIGINT PRIMARY KEY AUTO_INCREMENT, order_id BIGINT, venue VARCHAR(30), symbol VARCHAR(24), side VARCHAR(8), price DOUBLE, quantity DOUBLE, fee DOUBLE, ts DATETIME(6))""",
-    """CREATE TABLE IF NOT EXISTS positions (id BIGINT PRIMARY KEY AUTO_INCREMENT, symbol VARCHAR(24), side VARCHAR(8), entry_time DATETIME(6), entry_price DOUBLE, size_usdt DOUBLE, quantity DOUBLE, stop_price DOUBLE, target_price DOUBLE, current_price DOUBLE, unrealized_pnl DOUBLE, realized_pnl DOUBLE, status VARCHAR(30), signal_id BIGINT, rationale TEXT, updated_at DATETIME(6))""",
+    """CREATE TABLE IF NOT EXISTS positions (id BIGINT PRIMARY KEY AUTO_INCREMENT, symbol VARCHAR(24), side VARCHAR(8), venue VARCHAR(20) DEFAULT 'PAPER', entry_time DATETIME(6), entry_price DOUBLE, size_usdt DOUBLE, quantity DOUBLE, stop_price DOUBLE, target_price DOUBLE, current_price DOUBLE, unrealized_pnl DOUBLE, realized_pnl DOUBLE, status VARCHAR(30), signal_id BIGINT, rationale TEXT, updated_at DATETIME(6), KEY idx_positions_status_venue(status, venue))""",
     """CREATE TABLE IF NOT EXISTS pnl_snapshots (id BIGINT PRIMARY KEY AUTO_INCREMENT, realized_pnl DOUBLE, unrealized_pnl DOUBLE, daily_pnl DOUBLE, equity DOUBLE, current_dd_pct DOUBLE, ts DATETIME(6))""",
     """CREATE TABLE IF NOT EXISTS backtest_runs (id BIGINT PRIMARY KEY AUTO_INCREMENT, symbol VARCHAR(24), total_trades INT, win_rate DOUBLE, profit_factor DOUBLE, expectancy DOUBLE, avg_r DOUBLE, max_drawdown DOUBLE, sharpe_like DOUBLE, largest_winner DOUBLE, largest_loser DOUBLE, consecutive_losses INT, equity_curve_json JSON, ts DATETIME(6))""",
     """CREATE TABLE IF NOT EXISTS backtest_trades (id BIGINT PRIMARY KEY AUTO_INCREMENT, run_id BIGINT, symbol VARCHAR(24), side VARCHAR(8), entry_price DOUBLE, exit_price DOUBLE, pnl DOUBLE, r_multiple DOUBLE, entry_time DATETIME(6), exit_time DATETIME(6))""",
@@ -344,6 +409,7 @@ SCHEMA_SQL = [
     """CREATE TABLE IF NOT EXISTS risk_events (id BIGINT PRIMARY KEY AUTO_INCREMENT, event_type VARCHAR(80), severity VARCHAR(20), message TEXT, state_json JSON, ts DATETIME(6))""",
     """CREATE TABLE IF NOT EXISTS audit_log (id BIGINT PRIMARY KEY AUTO_INCREMENT, event_type VARCHAR(80), actor VARCHAR(80), symbol VARCHAR(24), message TEXT, metadata_json JSON, ts DATETIME(6))""",
     """CREATE TABLE IF NOT EXISTS trading_journal (id BIGINT PRIMARY KEY AUTO_INCREMENT, idempotency_key VARCHAR(220) UNIQUE, journal_code VARCHAR(40), journal_type VARCHAR(40), severity VARCHAR(20), actor VARCHAR(80), symbol VARCHAR(24), side VARCHAR(8), signal_key VARCHAR(180), model_version VARCHAR(80), confidence DOUBLE, expected_reversion_bps DOUBLE, actual_outcome INT NULL, actual_return DOUBLE NULL, feature_json JSON, context_json JSON, lesson_json JSON, created_at DATETIME(6), KEY idx_journal_code_created(journal_code, created_at), KEY idx_journal_symbol_created(symbol, created_at))""",
+    """CREATE TABLE IF NOT EXISTS journal_actions (id BIGINT PRIMARY KEY AUTO_INCREMENT, action_key VARCHAR(120) UNIQUE, title VARCHAR(220), status VARCHAR(30), rationale TEXT, source_summary TEXT, suppress_json JSON, approved_by VARCHAR(80), approved_at DATETIME(6), updated_at DATETIME(6), KEY idx_journal_actions_status(status, updated_at))""",
     """CREATE TABLE IF NOT EXISTS worker_heartbeat (worker_name VARCHAR(80) PRIMARY KEY, status VARCHAR(30), pid INT, host VARCHAR(120), last_seen DATETIME(6), detail_json JSON)""",
 ]
 
@@ -359,7 +425,10 @@ SCHEMA_MIGRATIONS = [
     "ALTER TABLE ml_predictions ADD COLUMN IF NOT EXISTS actual_return DOUBLE NULL",
     "ALTER TABLE ml_predictions ADD COLUMN IF NOT EXISTS training_date DATETIME(6) NULL",
     "ALTER TABLE ml_predictions ADD COLUMN IF NOT EXISTS evaluated_at DATETIME(6) NULL",
+    "ALTER TABLE positions ADD COLUMN IF NOT EXISTS venue VARCHAR(20) DEFAULT 'PAPER'",
+    "UPDATE positions SET venue='PAPER' WHERE venue IS NULL OR venue=''",
     "CREATE TABLE IF NOT EXISTS trading_journal (id BIGINT PRIMARY KEY AUTO_INCREMENT, idempotency_key VARCHAR(220) UNIQUE, journal_code VARCHAR(40), journal_type VARCHAR(40), severity VARCHAR(20), actor VARCHAR(80), symbol VARCHAR(24), side VARCHAR(8), signal_key VARCHAR(180), model_version VARCHAR(80), confidence DOUBLE, expected_reversion_bps DOUBLE, actual_outcome INT NULL, actual_return DOUBLE NULL, feature_json JSON, context_json JSON, lesson_json JSON, created_at DATETIME(6), KEY idx_journal_code_created(journal_code, created_at), KEY idx_journal_symbol_created(symbol, created_at))",
+    "CREATE TABLE IF NOT EXISTS journal_actions (id BIGINT PRIMARY KEY AUTO_INCREMENT, action_key VARCHAR(120) UNIQUE, title VARCHAR(220), status VARCHAR(30), rationale TEXT, source_summary TEXT, suppress_json JSON, approved_by VARCHAR(80), approved_at DATETIME(6), updated_at DATETIME(6), KEY idx_journal_actions_status(status, updated_at))",
     "CREATE TABLE IF NOT EXISTS validation_state (symbol VARCHAR(24) PRIMARY KEY, status VARCHAR(20), total_trades INT, win_rate DOUBLE, profit_factor DOUBLE, expectancy DOUBLE, max_drawdown DOUBLE, rolling_profit_factor DOUBLE, rolling_expectancy DOUBLE, walk_status VARCHAR(20), monte_status VARCHAR(20), summary_json JSON, updated_at DATETIME(6), KEY idx_validation_updated(updated_at))",
     "CREATE TABLE IF NOT EXISTS handoff_events (id BIGINT PRIMARY KEY AUTO_INCREMENT, idempotency_key VARCHAR(220) UNIQUE, stage VARCHAR(40), symbol VARCHAR(24), status VARCHAR(20), input_ref VARCHAR(180), output_ref VARCHAR(180), next_owner VARCHAR(80), reason TEXT, metadata_json JSON, created_at DATETIME(6), KEY idx_handoff_stage_created(stage, created_at), KEY idx_handoff_symbol_created(symbol, created_at))",
 ]
@@ -403,8 +472,10 @@ JOURNAL_CODES: dict[str, dict[str, str]] = {
     "AUTO_APPROVED": {"type": "APPROVAL", "severity": "INFO", "meaning": "Training auto-approval queued a paper/testnet request"},
     "ORDER_EXECUTED": {"type": "EXECUTION", "severity": "INFO", "meaning": "Order request created a paper/testnet position"},
     "ORDER_BLOCKED": {"type": "EXECUTION", "severity": "AMBER", "meaning": "Order request blocked by final execution gate"},
+    "TESTNET_ORDER_FAILED": {"type": "EXECUTION", "severity": "WARNING", "meaning": "Testnet venue rejected or failed an order attempt"},
     "OUTCOME_WIN": {"type": "FEEDBACK", "severity": "INFO", "meaning": "Prediction outcome was profitable or favorable"},
     "OUTCOME_LOSS": {"type": "FEEDBACK", "severity": "WARNING", "meaning": "Prediction outcome was unprofitable or unfavorable"},
+    "MISSED_PROFITABLE_CANDIDATE": {"type": "FEEDBACK", "severity": "AMBER", "meaning": "Blocked candidate would have been profitable over the learning horizon"},
     "MODEL_PROMOTED": {"type": "MODEL", "severity": "INFO", "meaning": "Candidate model promoted to active"},
     "MODEL_REJECTED": {"type": "MODEL", "severity": "WARNING", "meaning": "Candidate model rejected by promotion gates"},
     "VALIDATION_PASS": {"type": "VALIDATION", "severity": "INFO", "meaning": "Backtest, walk-forward, and Monte Carlo validation passed"},
@@ -466,6 +537,113 @@ def journal_code_rows() -> pd.DataFrame:
     return pd.DataFrame(
         [{"Code": code, "Type": spec["type"], "Severity": spec["severity"], "Meaning": spec["meaning"]} for code, spec in JOURNAL_CODES.items()]
     )
+
+
+APPROVED_JOURNAL_ACTIONS: list[dict[str, Any]] = [
+    {
+        "action_key": "suppress_non_deployable_auto_approval",
+        "title": "Stop auto-approval for non-deployable/config-blocked signals",
+        "rationale": "XRP SIG_BUY was repeatedly generated with research_only, trend_regime_adx_high, and validation_not_green:AMBER, then still auto-approved.",
+        "source_summary": "Approved from journal review on 2026-06-14.",
+        "suppress": ["research_only_auto_approval", "non_deployable_auto_approval"],
+    },
+    {
+        "action_key": "symbol_open_position_cooldown",
+        "title": "Add per-symbol open-position cooldown before creating new deployment requests",
+        "rationale": "Repeated XRP ORDER_BLOCKED entries had the same final gate reason: an open position already exists for this symbol.",
+        "source_summary": "Approved from journal review on 2026-06-14.",
+        "suppress": ["open_position_exists", "repeated_order_blocked_open_position"],
+    },
+    {
+        "action_key": "require_validation_for_training_auto_approval",
+        "title": "Require validation evidence before training auto-approval",
+        "rationale": "Validation was AMBER with zero trades across symbols while XRP continued to auto-approve.",
+        "source_summary": "Approved from journal review on 2026-06-14.",
+        "suppress": ["validation_not_green_auto_approval", "zero_trade_validation_auto_approval"],
+    },
+    {
+        "action_key": "collect_cross_symbol_labels",
+        "title": "Collect labeled paper outcomes for ETH, SOL, BNB, and XRP before trusting the model cross-symbol",
+        "rationale": "Feedback labels were concentrated in BTCUSDT while ETHUSDT, SOLUSDT, BNBUSDT, and XRPUSDT had no labels.",
+        "source_summary": "Approved from journal review on 2026-06-14.",
+        "suppress": ["missing_symbol_feedback", "cross_symbol_label_gap"],
+    },
+    {
+        "action_key": "do_not_promote_current_model",
+        "title": "Do not promote the current model; improve labels/features first",
+        "rationale": "Recent model decisions were rejected for accuracy_below_threshold around 35-36% accuracy.",
+        "source_summary": "Approved from journal review on 2026-06-14.",
+        "suppress": ["model_rejected_accuracy_below_threshold", "improve_labels_features_before_promotion"],
+    },
+    {
+        "action_key": "separate_trend_regime_candidates",
+        "title": "Separate trend-regime candidates instead of relaxing ADX globally",
+        "rationale": "trend_regime_adx_high appeared repeatedly, especially for XRP where the buy setup had ADX around 40.6.",
+        "source_summary": "Approved from journal review on 2026-06-14.",
+        "suppress": ["trend_regime_adx_high", "avoid_global_adx_relaxation"],
+    },
+    {
+        "action_key": "exclude_research_only_from_live_edge_metrics",
+        "title": "Keep research_only out of live-edge metrics",
+        "rationale": "research_only dominated blocker counts and is configuration noise, not market failure.",
+        "source_summary": "Approved from journal review on 2026-06-14.",
+        "suppress": ["research_only", "config_gated_noise"],
+    },
+    {
+        "action_key": "training_only_cost_hurdle_review",
+        "title": "Review training-only cost hurdle after more labels, not for production",
+        "rationale": "expected_move_below_cost_hurdle appeared frequently and should only be relaxed cautiously for paper/training exploration.",
+        "source_summary": "Approved from journal review on 2026-06-14.",
+        "suppress": ["expected_move_below_cost_hurdle", "training_cost_hurdle_review"],
+    },
+    {
+        "action_key": "analyze_participation_volatility_filters",
+        "title": "Analyze low-participation and volatility filters before relaxing",
+        "rationale": "low_participation and volatility_not_falling appeared repeatedly, mostly for BTC/ETH/SOL.",
+        "source_summary": "Approved from journal review on 2026-06-14.",
+        "suppress": ["low_participation", "volatility_not_falling"],
+    },
+]
+
+
+def mark_approved_journal_actions(engine: Engine | None, actor: str = "operator") -> int:
+    if engine is None:
+        return 0
+    init_schema(engine)
+    approved_at = now_utc().replace(tzinfo=None)
+    inserted = 0
+    with engine.begin() as conn:
+        for action in APPROVED_JOURNAL_ACTIONS:
+            result = conn.execute(
+                text(
+                    """INSERT INTO journal_actions(action_key, title, status, rationale, source_summary, suppress_json, approved_by, approved_at, updated_at)
+                       VALUES(:action_key, :title, 'APPROVED', :rationale, :source_summary, :suppress_json, :approved_by, :approved_at, :updated_at)
+                       ON DUPLICATE KEY UPDATE status='APPROVED', rationale=VALUES(rationale), source_summary=VALUES(source_summary), suppress_json=VALUES(suppress_json), approved_by=VALUES(approved_by), updated_at=VALUES(updated_at)"""
+                ),
+                {
+                    "action_key": action["action_key"],
+                    "title": action["title"],
+                    "rationale": action["rationale"],
+                    "source_summary": action["source_summary"],
+                    "suppress_json": json.dumps(action.get("suppress", [])),
+                    "approved_by": actor,
+                    "approved_at": approved_at,
+                    "updated_at": approved_at,
+                },
+            )
+            inserted += int(result.rowcount or 0)
+    return inserted
+
+
+def approved_journal_action_rows(engine: Engine | None) -> pd.DataFrame:
+    rows = db_rows(
+        engine,
+        """SELECT action_key, title, status, rationale, source_summary, approved_by, approved_at, updated_at
+           FROM journal_actions
+           WHERE status='APPROVED'
+           ORDER BY approved_at DESC, action_key ASC""",
+    )
+    return pd.DataFrame(rows)
 
 
 def record_handoff(
@@ -564,7 +742,7 @@ def fetch_binance_price(symbol: str) -> tuple[float, str]:
     try:
         return float(binance_get("/api/v3/ticker/price", {"symbol": symbol}, timeout=3)["price"]), "LIVE"
     except Exception:
-        return simulated_price(symbol), "SIMULATED"
+        return 0.0, "UNAVAILABLE"
 
 
 def fetch_binance_klines(symbol: str, interval: str, limit: int = 180) -> pd.DataFrame | None:
@@ -692,6 +870,67 @@ def simulated_orderbook() -> dict[str, Any]:
     }
 
 
+def unavailable_orderbook(reason: str = "UNAVAILABLE") -> dict[str, Any]:
+    return {
+        "bid_volume": 0.0,
+        "ask_volume": 0.0,
+        "bid_notional_20": 0.0,
+        "ask_notional_20": 0.0,
+        "obi": 0.0,
+        "spread_bps": 999.0,
+        "buy_slippage_bps": 999.0,
+        "sell_slippage_bps": 999.0,
+        "model_slippage_bps": 999.0,
+        "liquidity_score": 0.0,
+        "data_quality": reason,
+    }
+
+
+def unavailable_signal(symbol: str, price: float = 0.0, reason: str = "market_data_unavailable") -> dict[str, Any]:
+    blockers = [reason]
+    return {
+        "symbol": symbol,
+        "side": "HOLD",
+        "candidate_side": "HOLD",
+        "price": float(price or 0.0),
+        "composite_score": 0.0,
+        "z_score": 0.0,
+        "rsi": 50.0,
+        "volume_z": 0.0,
+        "taker_buy_ratio": 0.5,
+        "atr_pct": 0.0,
+        "adx": 0.0,
+        "realized_vol_ratio": 0.0,
+        "expected_reversion_bps": 0.0,
+        "htf_trend": 0.0,
+        "strategy_interval": CFG.strategy_interval,
+        "hold_bars": CFG.mean_reversion_hold_bars,
+        "research_only": CFG.mean_reversion_research_only,
+        "deployment_blockers": blockers,
+        "obi": 0.0,
+        "cross_exchange_spread_bps": 0.0,
+        "funding_pressure": 0.0,
+        "open_interest_signal": 0.0,
+        "model_slippage_bps": 999.0,
+        "spread_bps": 999.0,
+        "market_source": reason.upper(),
+        "market_data_quality": "UNAVAILABLE",
+        "ml_confidence": 0.0,
+        "ml_model_version": "not_scored",
+        "win_p_est": 0.0,
+        "payoff_b": 0.0,
+        "expected_value": 0.0,
+        "confidence": 0.0,
+        "kelly_fraction": 0.0,
+        "suggested_usdt": 0.0,
+        "deployable": False,
+        "validation_status": "AMBER",
+        "risk_status": "OK",
+        "rationale": f"Live data unavailable: {reason}.",
+        "ts": iso_now(),
+    }
+
+
 def fetch_coinbase_price(symbol: str) -> float | None:
     base = symbol.removesuffix("USDT")
     if base == symbol:
@@ -731,8 +970,7 @@ def fetch_funding_state(symbol: str) -> dict[str, Any]:
         percentile = float(pd.Series(rates).rank(pct=True).iloc[-1])
         return {"symbol": symbol, "funding_rate": latest, "percentile": percentile, "data_quality": "LIVE", "ts": iso_now()}
     except Exception:
-        latest = random.uniform(-0.00025, 0.00025)
-        return {"symbol": symbol, "funding_rate": latest, "percentile": random.uniform(0.2, 0.8), "data_quality": "SIMULATED", "ts": iso_now()}
+        return {"symbol": symbol, "funding_rate": 0.0, "percentile": 0.5, "data_quality": "UNAVAILABLE", "ts": iso_now()}
 
 
 def fetch_open_interest_state(symbol: str, previous_oi: float | None = None) -> dict[str, Any]:
@@ -742,8 +980,8 @@ def fetch_open_interest_state(symbol: str, previous_oi: float | None = None) -> 
         current = float(response.json()["openInterest"])
         quality = "LIVE"
     except Exception:
-        current = random.uniform(100000, 5000000)
-        quality = "SIMULATED"
+        current = float(previous_oi or 0.0)
+        quality = "UNAVAILABLE"
     base = previous_oi if previous_oi and previous_oi > 0 else current
     oi_change = (current - base) / max(base, 1e-9)
     return {"symbol": symbol, "open_interest": current, "oi_change": oi_change, "data_quality": quality, "ts": iso_now()}
@@ -756,9 +994,16 @@ def cross_exchange_state(symbol: str, binance_price: float) -> dict[str, Any]:
     }
     valid = {venue: price for venue, price in references.items() if price and price > 0}
     if not valid:
-        fallback = simulated_price(symbol)
-        valid = {"simulated_reference": fallback}
-        data_quality = "SIMULATED"
+        return {
+            "symbol": symbol,
+            "binance_price": binance_price,
+            "reference_price": 0.0,
+            "reference_venues": {},
+            "cross_exchange_spread_bps": 0.0,
+            "stale": True,
+            "data_quality": "UNAVAILABLE",
+            "ts": iso_now(),
+        }
     else:
         data_quality = "LIVE"
     reference_price = float(np.median(list(valid.values())))
@@ -826,11 +1071,13 @@ def fetch_orderbook(symbol: str) -> dict[str, Any]:
             "data_quality": "LIVE",
         }
     except Exception:
-        return simulated_orderbook()
+        return unavailable_orderbook("UNAVAILABLE")
 
 
 def alpha_signal(symbol: str, price: float, orderbook: dict[str, Any], cfg: Config, market_frame: pd.DataFrame | None = None, htf_frame: pd.DataFrame | None = None, allow_live_fetch: bool = True) -> dict[str, Any]:
-    frame = market_frame if market_frame is not None and len(market_frame) >= 80 else synthetic_ohlcv(symbol, bars=180)
+    frame = market_frame if market_frame is not None and len(market_frame) >= 30 else None
+    if frame is None:
+        return unavailable_signal(symbol, price, "kline_history_unavailable")
     indicators = add_indicators(frame)
     latest = indicators.iloc[-1] if not indicators.empty else pd.Series({"z": 0.0, "rsi": 50.0, "vol_z": 0.0, "ema20": price, "ema50": price, "taker_buy_ratio": 0.5, "adx": 99.0, "realized_vol_fast": 1.0, "realized_vol_slow": 0.0, "expected_reversion_bps": 0.0})
     z_score = float(latest.get("z", 0.0))
@@ -843,13 +1090,13 @@ def alpha_signal(symbol: str, price: float, orderbook: dict[str, Any], cfg: Conf
     realized_vol_slow = float(latest.get("realized_vol_slow", 0.0))
     realized_vol_ratio = realized_vol_fast / max(realized_vol_slow, 1e-9)
     expected_reversion_bps = float(latest.get("expected_reversion_bps", 0.0))
-    htf = htf_frame if htf_frame is not None and len(htf_frame) >= 80 else fetch_binance_klines(symbol, cfg.higher_timeframe_interval, limit=120) if allow_live_fetch else None
-    htf_indicators = add_indicators(htf) if htf is not None and len(htf) >= 80 else pd.DataFrame()
+    htf = htf_frame if htf_frame is not None and len(htf_frame) >= 30 else fetch_binance_klines(symbol, cfg.higher_timeframe_interval, limit=120) if allow_live_fetch else None
+    htf_indicators = add_indicators(htf) if htf is not None and len(htf) >= 30 else pd.DataFrame()
     htf_latest = htf_indicators.iloc[-1] if not htf_indicators.empty else None
     htf_trend = 0.0 if htf_latest is None else float((htf_latest["ema20"] - htf_latest["ema50"]) / max(float(htf_latest["close"]), 1e-9))
-    cross_spread = float(orderbook.get("cross_exchange_spread_bps", np.random.normal(0, 4)))
-    funding_pressure = float(np.clip(np.random.normal(-z_score * 0.15, 0.25), -1, 1))
-    oi_signal = float(np.clip(np.random.normal(z_score * 0.12, 0.35), -1, 1))
+    cross_spread = float(orderbook.get("cross_exchange_spread_bps", 0.0))
+    funding_pressure = float(np.clip(float(orderbook.get("funding_pressure", 0.0)), -1, 1))
+    oi_signal = float(np.clip(float(orderbook.get("open_interest_signal", 0.0)), -1, 1))
     trend = float(np.clip((float(latest.get("ema20", price)) - float(latest.get("ema50", price))) / max(price, 1e-9) * 100, -1, 1))
     execution_quality = max(0.0, min(1.0, orderbook["liquidity_score"] - orderbook["spread_bps"] / 30))
     score = (
@@ -933,7 +1180,7 @@ def alpha_signal(symbol: str, price: float, orderbook: dict[str, Any], cfg: Conf
         "open_interest_signal": oi_signal,
         "model_slippage_bps": float(side_slippage if side != "HOLD" else orderbook.get("model_slippage_bps", 0.0)),
         "spread_bps": float(orderbook["spread_bps"]),
-        "market_source": "CANDLE_BUFFER" if market_frame is not None and len(market_frame) >= 80 else "SYNTHETIC_OR_REST",
+        "market_source": "CANDLE_BUFFER",
         "market_data_quality": str(orderbook.get("data_quality", "UNKNOWN")),
         "ml_confidence": 0.0,
         "ml_model_version": "not_scored",
@@ -979,6 +1226,15 @@ def synthetic_ohlcv(symbol: str, bars: int = 360) -> pd.DataFrame:
 
 def add_indicators(frame: pd.DataFrame, lookback: int = 40) -> pd.DataFrame:
     data = frame.copy()
+    if len(data) < 30:
+        return pd.DataFrame()
+    basis_window = min(lookback, max(10, len(data) // 2))
+    atr_window = min(14, max(5, len(data) // 3))
+    rsi_window = atr_window
+    adx_window = atr_window
+    volume_window = min(50, max(10, len(data) // 2))
+    fast_window = min(20, max(5, len(data) // 3))
+    slow_window = min(80, max(fast_window + 1, len(data) - 5))
     if "quote_volume" not in data:
         data["quote_volume"] = data["volume"] * data["close"]
     if "taker_buy_quote" not in data:
@@ -986,8 +1242,8 @@ def add_indicators(frame: pd.DataFrame, lookback: int = 40) -> pd.DataFrame:
     data["ret"] = data["close"].pct_change()
     data["ema20"] = data["close"].ewm(span=20, adjust=False).mean()
     data["ema50"] = data["close"].ewm(span=50, adjust=False).mean()
-    data["basis"] = data["close"].rolling(lookback).mean()
-    data["std"] = data["close"].rolling(lookback).std()
+    data["basis"] = data["close"].rolling(basis_window).mean()
+    data["std"] = data["close"].rolling(basis_window).std()
     data["z"] = (data["close"] - data["basis"]) / data["std"].replace(0, np.nan)
     true_range = pd.concat(
         [
@@ -997,25 +1253,25 @@ def add_indicators(frame: pd.DataFrame, lookback: int = 40) -> pd.DataFrame:
         ],
         axis=1,
     ).max(axis=1)
-    data["atr"] = true_range.rolling(14).mean()
+    data["atr"] = true_range.rolling(atr_window).mean()
     data["atr_pct"] = data["atr"] / data["close"]
     up_move = data["high"].diff()
     down_move = -data["low"].diff()
     plus_dm = np.where((up_move > down_move) & (up_move > 0), up_move, 0.0)
     minus_dm = np.where((down_move > up_move) & (down_move > 0), down_move, 0.0)
-    plus_di = 100 * pd.Series(plus_dm, index=data.index).rolling(14).sum() / true_range.rolling(14).sum().replace(0, np.nan)
-    minus_di = 100 * pd.Series(minus_dm, index=data.index).rolling(14).sum() / true_range.rolling(14).sum().replace(0, np.nan)
+    plus_di = 100 * pd.Series(plus_dm, index=data.index).rolling(adx_window).sum() / true_range.rolling(adx_window).sum().replace(0, np.nan)
+    minus_di = 100 * pd.Series(minus_dm, index=data.index).rolling(adx_window).sum() / true_range.rolling(adx_window).sum().replace(0, np.nan)
     dx = ((plus_di - minus_di).abs() / (plus_di + minus_di).replace(0, np.nan)) * 100
-    data["adx"] = dx.rolling(14).mean()
+    data["adx"] = dx.rolling(adx_window).mean()
     delta = data["close"].diff()
-    gain = delta.clip(lower=0).rolling(14).mean()
-    loss = (-delta.clip(upper=0)).rolling(14).mean()
+    gain = delta.clip(lower=0).rolling(rsi_window).mean()
+    loss = (-delta.clip(upper=0)).rolling(rsi_window).mean()
     rs = gain / loss.replace(0, np.nan)
     data["rsi"] = 100 - (100 / (1 + rs))
-    data["vol_z"] = (data["quote_volume"] - data["quote_volume"].rolling(50).mean()) / data["quote_volume"].rolling(50).std().replace(0, np.nan)
+    data["vol_z"] = (data["quote_volume"] - data["quote_volume"].rolling(volume_window).mean()) / data["quote_volume"].rolling(volume_window).std().replace(0, np.nan)
     data["taker_buy_ratio"] = data["taker_buy_quote"] / data["quote_volume"].replace(0, np.nan)
-    data["realized_vol_fast"] = data["ret"].rolling(20).std()
-    data["realized_vol_slow"] = data["ret"].rolling(80).std()
+    data["realized_vol_fast"] = data["ret"].rolling(fast_window).std()
+    data["realized_vol_slow"] = data["ret"].rolling(slow_window).std()
     data["expected_reversion_bps"] = ((data["basis"] - data["close"]).abs() / data["close"].replace(0, np.nan)) * 10000
     return data.dropna().reset_index(drop=True)
 
@@ -1184,6 +1440,9 @@ def signal_features(signal: dict[str, Any]) -> dict[str, float]:
     z_score = float(signal.get("z_score", 0.0))
     rsi = float(signal.get("rsi", 50.0))
     side = str(signal.get("side", "HOLD"))
+    candidate_side = str(signal.get("candidate_side", side))
+    if side == "HOLD" and candidate_side in {"BUY", "SELL"}:
+        side = candidate_side
     rsi_distance = (35.0 - rsi) if side == "BUY" else (rsi - 65.0) if side == "SELL" else abs(rsi - 50.0)
     return {
         "z_abs": abs(z_score),
@@ -1499,6 +1758,160 @@ def persist_model_candidate(engine: Engine | None, state: RedisState, model: dic
     )
 
 
+def evaluate_pending_ml_predictions(engine: Engine | None, state: RedisState, limit: int = 500) -> int:
+    if engine is None:
+        return 0
+    horizon_seconds = interval_to_seconds(CFG.strategy_interval) * max(int(CFG.mean_reversion_hold_bars), 1)
+    rows = db_rows(
+        engine,
+        f"""SELECT p.idempotency_key, p.symbol, p.side, p.confidence, p.threshold, p.feature_json, p.created_at,
+                  s.price AS entry_price, s.expected_reversion_bps
+           FROM ml_predictions p
+           JOIN signals s ON s.idempotency_key = p.idempotency_key
+           WHERE p.actual_outcome IS NULL
+             AND p.side IN ('BUY', 'SELL')
+             AND p.created_at <= DATE_SUB(UTC_TIMESTAMP(), INTERVAL {int(horizon_seconds)} SECOND)
+           ORDER BY p.created_at ASC
+           LIMIT {int(limit)}""",
+    )
+    evaluated = 0
+    for row in rows:
+        try:
+            symbol = str(row.get("symbol") or "")
+            side = str(row.get("side") or "")
+            entry_price = float(row.get("entry_price") or 0.0)
+            if not symbol or side not in {"BUY", "SELL"} or entry_price <= 0:
+                continue
+            latest = state.get_json(f"latest_price:{symbol}") or {}
+            if not fresh_payload(latest, max(CFG.market_data_ws_stale_seconds, 180)) or str(latest.get("data_quality", "")).upper() != "LIVE":
+                continue
+            current_price = float(latest.get("price") or 0.0)
+            if current_price <= 0:
+                continue
+            direction = 1 if side == "BUY" else -1
+            gross_return = ((current_price - entry_price) / max(entry_price, 1e-9)) * direction
+            cost_return = (2 * CFG.fee_bps + CFG.slippage_bps) / 10000
+            net_return = gross_return - cost_return
+            label = int(net_return > 0)
+            features = safe_json_dict(row.get("feature_json"))
+            ts = now_utc().replace(tzinfo=None)
+            key = str(row.get("idempotency_key"))
+            blocked_context_rows = db_rows(
+                engine,
+                """SELECT context_json FROM trading_journal
+                   WHERE signal_key=:key AND journal_code='SIG_BLOCKED'
+                   ORDER BY id DESC LIMIT 1""",
+                {"key": key},
+            )
+            blocked_context = safe_json_dict(blocked_context_rows[0].get("context_json")) if blocked_context_rows else {}
+            blockers = blocked_context.get("blockers", [])
+            if not isinstance(blockers, list):
+                blockers = []
+            was_blocked = bool(blockers)
+            hypothetical_size = min(CFG.training_auto_approve_max_position_usdt, CFG.max_position_usdt)
+            gross_pnl = gross_return * hypothetical_size
+            net_pnl = net_return * hypothetical_size
+            with engine.begin() as conn:
+                result = conn.execute(
+                    text("""UPDATE ml_predictions
+                            SET actual_outcome=:label, actual_return=:ret, evaluated_at=:ts
+                            WHERE idempotency_key=:key AND actual_outcome IS NULL"""),
+                    {"label": label, "ret": net_return, "ts": ts, "key": key},
+                )
+                conn.execute(
+                    text("""INSERT IGNORE INTO trade_outcomes(idempotency_key, symbol, side, label, forward_return, max_favorable_bps, max_adverse_bps, horizon_bars, outcome_json, ts)
+                            VALUES(:key, :symbol, :side, :label, :ret, :mfe, :mae, :horizon, :outcome, :ts)"""),
+                    {
+                        "key": key,
+                        "symbol": symbol,
+                        "side": side,
+                        "label": label,
+                        "ret": net_return,
+                        "mfe": max(gross_return * 10000, 0.0),
+                        "mae": min(gross_return * 10000, 0.0),
+                        "horizon": CFG.mean_reversion_hold_bars,
+                        "outcome": json.dumps(
+                            {
+                                "label_rule": "live_prediction_horizon_elapsed",
+                                "entry_price": entry_price,
+                                "exit_price": current_price,
+                                "cost_bps": 2 * CFG.fee_bps + CFG.slippage_bps,
+                                "gross_return_bps": gross_return * 10000,
+                                "net_return_bps": net_return * 10000,
+                                "hypothetical_size_usdt": hypothetical_size,
+                                "hypothetical_net_pnl": net_pnl,
+                                "was_blocked": was_blocked,
+                                "blockers": blockers,
+                            }
+                        ),
+                        "ts": ts,
+                    },
+                )
+            if result.rowcount:
+                evaluated += 1
+                journal_write(
+                    engine,
+                    state,
+                    key=f"journal:{key}:{'OUTCOME_WIN' if label else 'OUTCOME_LOSS'}",
+                    code="OUTCOME_WIN" if label else "OUTCOME_LOSS",
+                    actor="worker-ml-live-evaluator",
+                    symbol=symbol,
+                    side=side,
+                    signal_key=key,
+                    confidence=float(row.get("confidence") or 0.0),
+                    expected_reversion_bps=float(row.get("expected_reversion_bps") or 0.0),
+                    actual_outcome=label,
+                    actual_return=net_return,
+                    features=features,
+                    context={
+                        "horizon_seconds": horizon_seconds,
+                        "entry_price": entry_price,
+                        "exit_price": current_price,
+                        "gross_return_bps": gross_return * 10000,
+                        "net_return_bps": net_return * 10000,
+                        "hypothetical_size_usdt": hypothetical_size,
+                        "hypothetical_gross_pnl": gross_pnl,
+                        "hypothetical_net_pnl": net_pnl,
+                        "was_blocked": was_blocked,
+                        "blockers": blockers,
+                    },
+                    lesson={"feedback_use": "live_prediction_evaluation", "return_bps": net_return * 10000, "hypothetical_net_pnl": net_pnl},
+                )
+                if label and was_blocked:
+                    journal_write(
+                        engine,
+                        state,
+                        key=f"journal:{key}:MISSED_PROFITABLE_CANDIDATE",
+                        code="MISSED_PROFITABLE_CANDIDATE",
+                        actor="worker-ml-live-evaluator",
+                        symbol=symbol,
+                        side=side,
+                        signal_key=key,
+                        confidence=float(row.get("confidence") or 0.0),
+                        expected_reversion_bps=float(row.get("expected_reversion_bps") or 0.0),
+                        actual_outcome=label,
+                        actual_return=net_return,
+                        features=features,
+                        context={
+                            "blockers": blockers,
+                            "entry_price": entry_price,
+                            "exit_price": current_price,
+                            "net_return_bps": net_return * 10000,
+                            "hypothetical_size_usdt": hypothetical_size,
+                            "hypothetical_net_pnl": net_pnl,
+                        },
+                        lesson={
+                            "action": "review_blocker_for_profitable_candidate",
+                            "feedback_use": "gate_correction",
+                            "blockers": blockers,
+                            "hypothetical_net_pnl": net_pnl,
+                        },
+                    )
+        except Exception:
+            continue
+    return evaluated
+
+
 def walk_forward_summary(trades: pd.DataFrame, folds: int = 5) -> dict[str, Any]:
     if trades.empty or len(trades) < folds * 3:
         return {"status": "AMBER", "train_perf": 0.0, "test_perf": 0.0, "degradation_pct": 0.0, "parameter_stability": 0.0, "overfit_warning": "Insufficient trades"}
@@ -1561,7 +1974,17 @@ def validation_snapshot(symbol: str, allow_live_fetch: bool = True) -> dict[str,
     if frame is None and allow_live_fetch:
         frame = fetch_binance_klines(symbol, CFG.strategy_interval, limit=CFG.validation_backtest_bars)
     if frame is None:
-        frame = synthetic_ohlcv(symbol, bars=CFG.validation_backtest_bars)
+        empty_metrics = metrics_from_trades(pd.DataFrame())
+        return {
+            "symbol": symbol,
+            "backtest": {**empty_metrics, "performance_gate": {"profit_factor_ok": False, "expectancy_ok": False, "drawdown_ok": True, "rolling_ok": False, "enough_trades": False}},
+            "rolling": empty_metrics,
+            "walk_forward": walk_forward_summary(pd.DataFrame()),
+            "monte_carlo": monte_carlo_summary(pd.DataFrame()),
+            "validation_status": "AMBER",
+            "trades": pd.DataFrame(),
+            "data_quality": "UNAVAILABLE",
+        }
     trades = run_backtest_for_frame(symbol, frame)
     backtest = metrics_from_trades(trades)
     rolling = metrics_from_trades(trades.tail(CFG.rolling_validation_trades)) if not trades.empty else metrics_from_trades(trades)
@@ -1701,10 +2124,14 @@ def latest_validation_snapshot(state: RedisState, engine: Engine | None, symbol:
 def run_validation_cycle(state: RedisState, engine: Engine | None, use_locks: bool = True) -> dict[str, str]:
     cycle_started = now_utc()
     statuses: dict[str, str] = {}
+    heartbeat(engine, state, "worker-validation", detail={"phase": "cycle_start", "interval_seconds": CFG.validation_worker_seconds})
     for symbol in CFG.symbols:
         if use_locks and not state.lock(f"lock:validation_worker:{symbol}", ttl=max(CFG.validation_worker_seconds - 5, 60)):
+            statuses[symbol] = "LOCKED"
+            heartbeat(engine, state, "worker-validation", detail={"phase": "lock_skipped", "symbol": symbol, "statuses": statuses, "interval_seconds": CFG.validation_worker_seconds})
             continue
         try:
+            heartbeat(engine, state, "worker-validation", detail={"phase": "validating", "symbol": symbol, "statuses": statuses, "interval_seconds": CFG.validation_worker_seconds})
             snapshot = validation_snapshot(symbol, allow_live_fetch=True)
             compact = compact_validation_payload(snapshot)
             persist_validation_snapshot(engine, snapshot)
@@ -1750,6 +2177,7 @@ def run_validation_cycle(state: RedisState, engine: Engine | None, use_locks: bo
                 reason=reason,
                 metadata={"store_paths": CFG.validation_store_paths, "history_days": CFG.validation_history_days},
             )
+            heartbeat(engine, state, "worker-validation", detail={"phase": "symbol_complete", "symbol": symbol, "statuses": statuses, "interval_seconds": CFG.validation_worker_seconds})
         except Exception as exc:
             statuses[symbol] = "ERROR"
             record_handoff(
@@ -1765,6 +2193,7 @@ def run_validation_cycle(state: RedisState, engine: Engine | None, use_locks: bo
                 reason=f"Validation failed: {exc}",
                 metadata={},
             )
+            heartbeat(engine, state, "worker-validation", status="DEGRADED", detail={"phase": "symbol_error", "symbol": symbol, "error": str(exc)[:300], "statuses": statuses, "interval_seconds": CFG.validation_worker_seconds})
     heartbeat(engine, state, "worker-validation", detail={"statuses": statuses, "interval_seconds": CFG.validation_worker_seconds})
     return statuses
 
@@ -1784,7 +2213,18 @@ def run_validation() -> None:
         cycle_started = now_utc()
         run_validation_cycle(state, engine, use_locks=True)
         elapsed = (now_utc() - cycle_started).total_seconds()
-        time.sleep(max(30, CFG.validation_worker_seconds - elapsed))
+        sleep_until = time.monotonic() + max(30, CFG.validation_worker_seconds - elapsed)
+        while True:
+            remaining = max(0, int(sleep_until - time.monotonic()))
+            if remaining <= 0:
+                break
+            heartbeat(
+                engine,
+                state,
+                "worker-validation",
+                detail={"phase": "sleeping", "next_cycle_in_seconds": remaining, "interval_seconds": CFG.validation_worker_seconds},
+            )
+            time.sleep(min(30, remaining))
 
 
 def run_marketdata_rest_poll(state: RedisState, engine: Engine) -> None:
@@ -1798,10 +2238,11 @@ def run_marketdata_rest_poll(state: RedisState, engine: Engine) -> None:
             tick = {"symbol": symbol, "price": price, "source": f"{CFG.binance_rest_base_url}:REST_KLINE", "data_quality": "LIVE", "ts": iso_now()}
         state.set_json(f"latest_price:{symbol}", tick, ex=120)
         state.set_json(f"market_feed_status:{symbol}", {**tick, "mode": "REST_POLL"}, ex=180)
-        state.publish("market_ticks", tick)
-        db_execute(engine, "INSERT INTO market_ticks(symbol, price, source, data_quality, ts) VALUES(:symbol, :price, :source, :data_quality, :ts)", {**tick, "ts": now_utc().replace(tzinfo=None)})
+        if quality == "LIVE" or price > 0:
+            state.publish("market_ticks", tick)
+            db_execute(engine, "INSERT INTO market_ticks(symbol, price, source, data_quality, ts) VALUES(:symbol, :price, :source, :data_quality, :ts)", {**tick, "ts": now_utc().replace(tzinfo=None)})
         ob = fetch_orderbook(symbol)
-        cross_state = cross_exchange_state(symbol, price)
+        cross_state = cross_exchange_state(symbol, price) if price > 0 else {"symbol": symbol, "binance_price": price, "reference_price": 0.0, "reference_venues": {}, "cross_exchange_spread_bps": 0.0, "stale": True, "data_quality": "UNAVAILABLE", "ts": iso_now()}
         state.set_json(f"latest_cross_exchange:{symbol}", cross_state, ex=120)
         state.set_json(f"latest_external_prices:{symbol}", cross_state, ex=120)
         ob["cross_exchange_spread_bps"] = cross_state["cross_exchange_spread_bps"]
@@ -1832,14 +2273,17 @@ def seed_marketdata_history(state: RedisState, engine: Engine) -> dict[str, pd.D
     for symbol in CFG.symbols:
         frame = fetch_binance_klines(symbol, "1m", limit=CFG.market_data_history_limit)
         if frame is None or frame.empty:
-            frame = synthetic_ohlcv(symbol, bars=min(CFG.market_data_history_limit, 240))
-            source = "SIMULATED_SEED"
-        else:
-            source = f"{CFG.binance_rest_base_url}:REST_SEED"
+            state.set_json(
+                f"market_feed_status:{symbol}",
+                {"symbol": symbol, "price": 0.0, "source": f"{CFG.binance_rest_base_url}:REST_SEED", "data_quality": "UNAVAILABLE", "mode": "SEED", "ts": iso_now()},
+                ex=300,
+            )
+            continue
+        source = f"{CFG.binance_rest_base_url}:REST_SEED"
         buffers[symbol] = frame.tail(CFG.market_data_history_limit).reset_index(drop=True)
         store_candle_frames(state, symbol, buffers[symbol], source=source, closed=True)
         price = float(buffers[symbol]["close"].iloc[-1])
-        quality = "SIMULATED" if source == "SIMULATED_SEED" else "LIVE"
+        quality = "LIVE"
         tick = {"symbol": symbol, "price": price, "source": source, "data_quality": quality, "ts": iso_now()}
         state.set_json(f"latest_price:{symbol}", tick, ex=180)
         state.set_json(f"market_feed_status:{symbol}", {**tick, "mode": "SEED"}, ex=300)
@@ -1871,9 +2315,10 @@ def run_marketdata_websocket(state: RedisState, engine: Engine) -> None:
             return
         last_aux_refresh = time.time()
         for symbol in CFG.symbols:
-            latest = state.get_json(f"latest_price:{symbol}") or {"price": simulated_price(symbol)}
+            latest = state.get_json(f"latest_price:{symbol}") or {}
+            live_price = fresh_payload(latest, max(CFG.market_data_ws_stale_seconds, 180)) and str(latest.get("data_quality", "")).upper() == "LIVE"
             ob = fetch_orderbook(symbol)
-            cross_state = cross_exchange_state(symbol, float(latest.get("price", simulated_price(symbol))))
+            cross_state = cross_exchange_state(symbol, float(latest.get("price", 0.0))) if live_price else {"symbol": symbol, "binance_price": float(latest.get("price", 0.0) or 0.0), "reference_price": 0.0, "reference_venues": {}, "cross_exchange_spread_bps": 0.0, "stale": True, "data_quality": "UNAVAILABLE", "ts": iso_now()}
             state.set_json(f"latest_cross_exchange:{symbol}", cross_state, ex=120)
             ob["cross_exchange_spread_bps"] = cross_state["cross_exchange_spread_bps"]
             ob_payload = {"symbol": symbol, **ob, "ts": iso_now()}
@@ -2019,22 +2464,28 @@ def run_signal() -> None:
         drift_training = load_labeled_training_from_db(engine) if CFG.ml_drift_gate_enabled and model else pd.DataFrame()
         bucket = int(time.time() // 60)
         for symbol in CFG.symbols:
-            price_payload = state.get_json(f"latest_price:{symbol}") or {"price": simulated_price(symbol), "data_quality": "SIMULATED"}
+            price_payload = state.get_json(f"latest_price:{symbol}") or {}
+            price_cache_ok = fresh_payload(price_payload, max(CFG.market_data_ws_stale_seconds, 180)) and str(price_payload.get("data_quality", "")).upper() == "LIVE"
+            price_value = float(price_payload.get("price") or 0.0)
             ob = state.get_json(f"latest_orderbook:{symbol}") or fetch_orderbook(symbol)
-            cross_state = state.get_json(f"latest_cross_exchange:{symbol}") or cross_exchange_state(symbol, float(price_payload["price"]))
+            cross_state = state.get_json(f"latest_cross_exchange:{symbol}") or (cross_exchange_state(symbol, price_value) if price_cache_ok and price_value > 0 else {"cross_exchange_spread_bps": 0.0, "data_quality": "UNAVAILABLE"})
             ob["cross_exchange_spread_bps"] = cross_state["cross_exchange_spread_bps"]
+            funding = state.get_json(f"latest_funding:{symbol}") or {"funding_rate": 0.0, "percentile": 0.5}
+            oi = state.get_json(f"latest_open_interest:{symbol}") or {"oi_change": 0.0}
+            ob["funding_pressure"] = float(np.clip(float(funding.get("funding_rate", 0.0)) * 6000, -1, 1))
+            ob["open_interest_signal"] = float(np.clip(float(oi.get("oi_change", 0.0)) * 10, -1, 1))
             market_frame = latest_candle_frame(state, symbol, CFG.strategy_interval, limit=180)
             if market_frame is None:
                 market_frame = fetch_binance_klines(symbol, CFG.strategy_interval, limit=180)
             htf_frame = latest_candle_frame(state, symbol, CFG.higher_timeframe_interval, limit=120)
-            signal = alpha_signal(symbol, float(price_payload["price"]), ob, CFG, market_frame=market_frame, htf_frame=htf_frame)
+            signal = alpha_signal(symbol, price_value, ob, CFG, market_frame=market_frame if price_cache_ok else None, htf_frame=htf_frame)
             signal["market_source"] = str(price_payload.get("source", signal.get("market_source", "")))
             signal["market_data_quality"] = str(price_payload.get("data_quality", signal.get("market_data_quality", "")))
-            funding = state.get_json(f"latest_funding:{symbol}") or {"funding_rate": 0.0, "percentile": 0.5}
-            oi = state.get_json(f"latest_open_interest:{symbol}") or {"oi_change": 0.0}
             signal["funding_pressure"] = float(np.clip(float(funding.get("funding_rate", 0.0)) * 6000, -1, 1))
             signal["open_interest_signal"] = float(np.clip(float(oi.get("oi_change", 0.0)) * 10, -1, 1))
-            key = f"{symbol}:{CFG.interval}:{bucket}:{signal['side']}"
+            prediction_side = str(signal.get("candidate_side") or signal.get("side") or "HOLD")
+            key_side = prediction_side if prediction_side in {"BUY", "SELL"} else str(signal.get("side", "HOLD"))
+            key = f"{symbol}:{CFG.interval}:{bucket}:{key_side}"
             if not state.lock(f"lock:signal:{key}", ttl=55):
                 continue
             signal["idempotency_key"] = key
@@ -2061,23 +2512,24 @@ def run_signal() -> None:
             db_execute(
                 engine,
                 "INSERT IGNORE INTO feature_snapshots(idempotency_key, symbol, side, strategy_interval, feature_json, source, ts) VALUES(:key, :symbol, :side, :interval, :features, 'worker-signal', :ts)",
-                {"key": key, "symbol": symbol, "side": signal["side"], "interval": CFG.strategy_interval, "features": json.dumps(features), "ts": now_utc().replace(tzinfo=None)},
+                {"key": key, "symbol": symbol, "side": prediction_side, "interval": CFG.strategy_interval, "features": json.dumps(features), "ts": now_utc().replace(tzinfo=None)},
             )
-            db_execute(
-                engine,
-                "INSERT IGNORE INTO ml_predictions(idempotency_key, symbol, side, model_version, confidence, threshold, feature_json, training_date, created_at) VALUES(:key, :symbol, :side, :version, :confidence, :threshold, :features, :training_date, :ts)",
-                {
-                    "key": key,
-                    "symbol": symbol,
-                    "side": signal["side"],
-                    "version": ml_version,
-                    "confidence": ml_confidence,
-                    "threshold": CFG.min_ml_confidence,
-                    "features": json.dumps(features),
-                    "training_date": utc_naive_timestamp(pd.Timestamp(model.get("trained_at"))) if model and model.get("trained_at") else None,
-                    "ts": now_utc().replace(tzinfo=None),
-                },
-            )
+            if prediction_side in {"BUY", "SELL"}:
+                db_execute(
+                    engine,
+                    "INSERT IGNORE INTO ml_predictions(idempotency_key, symbol, side, model_version, confidence, threshold, feature_json, training_date, created_at) VALUES(:key, :symbol, :side, :version, :confidence, :threshold, :features, :training_date, :ts)",
+                    {
+                        "key": key,
+                        "symbol": symbol,
+                        "side": prediction_side,
+                        "version": ml_version,
+                        "confidence": ml_confidence,
+                        "threshold": CFG.min_ml_confidence,
+                        "features": json.dumps(features),
+                        "training_date": utc_naive_timestamp(pd.Timestamp(model.get("trained_at"))) if model and model.get("trained_at") else None,
+                        "ts": now_utc().replace(tzinfo=None),
+                    },
+                )
             db_execute(
                 engine,
                 """INSERT IGNORE INTO signals(idempotency_key, symbol, side, price, composite_score, z_score, rsi, volume_z, adx, expected_reversion_bps, ml_confidence, ml_model_version, obi, cross_exchange_spread_bps, funding_pressure, open_interest_signal, win_p_est, payoff_b, kelly_fraction, suggested_usdt, deployable, confidence, rationale, validation_status, risk_status, ts)
@@ -2244,21 +2696,47 @@ def run_pnl() -> None:
     while True:
         realized = 0.0
         unrealized = 0.0
+        paper_realized = 0.0
+        paper_unrealized = 0.0
+        live_realized = 0.0
+        live_unrealized = 0.0
         open_count = 0
         if engine is not None:
             try:
                 with engine.begin() as conn:
                     positions = conn.execute(
-                        text("SELECT id, symbol, side, entry_price, size_usdt, quantity, stop_price, target_price, realized_pnl FROM positions WHERE status='OPEN'")
+                        text("SELECT id, symbol, side, COALESCE(venue, 'PAPER') AS venue, entry_price, size_usdt, quantity, stop_price, target_price, current_price, realized_pnl FROM positions WHERE status='OPEN'")
                     ).fetchall()
+                    realized_rows = conn.execute(
+                        text("""SELECT COALESCE(venue, 'PAPER') AS venue, SUM(COALESCE(realized_pnl, 0)) AS realized
+                                FROM positions WHERE status='CLOSED' GROUP BY COALESCE(venue, 'PAPER')""")
+                    ).fetchall()
+                    paper_realized = sum(float(row.realized or 0.0) for row in realized_rows if str(row.venue).upper() != "LIVE")
+                    live_realized = sum(float(row.realized or 0.0) for row in realized_rows if str(row.venue).upper() == "LIVE")
+                    realized = paper_realized + live_realized
                     risk_state = state.get_json("risk_state") or {"status": "RISK_OK"}
+                    paper_unrealized = 0.0
+                    live_unrealized = 0.0
                     for position in positions:
                         open_count += 1
-                        latest = state.get_json(f"latest_price:{position.symbol}") or {"price": simulated_price(position.symbol)}
-                        current_price = float(latest["price"])
+                        venue = str(position.venue or "PAPER").upper()
+                        latest = state.get_json(f"latest_price:{position.symbol}") or {}
+                        live_price = fresh_payload(latest, max(CFG.market_data_ws_stale_seconds, 180)) and str(latest.get("data_quality", "")).upper() == "LIVE"
+                        current_price = float(latest.get("price") or position.current_price or position.entry_price)
+                        if not live_price:
+                            state.set_json(
+                                f"live_position:{position.symbol}",
+                                {"symbol": position.symbol, "side": position.side, "venue": venue, "status": "OPEN", "entry_price": position.entry_price, "current_price": current_price, "price_data_quality": "UNAVAILABLE", "unrealized_pnl": float(getattr(position, "unrealized_pnl", 0.0) or 0.0), "stop_price": position.stop_price, "target_price": position.target_price, "ts": iso_now()},
+                                ex=180,
+                            )
+                            continue
                         direction = 1 if position.side == "BUY" else -1
                         position_unrealized = (current_price - float(position.entry_price)) * direction * float(position.quantity)
                         unrealized += position_unrealized
+                        if venue == "LIVE":
+                            live_unrealized += position_unrealized
+                        else:
+                            paper_unrealized += position_unrealized
                         stop_hit = position.side == "BUY" and current_price <= float(position.stop_price) or position.side == "SELL" and current_price >= float(position.stop_price)
                         target_hit = position.side == "BUY" and current_price >= float(position.target_price) or position.side == "SELL" and current_price <= float(position.target_price)
                         risk_exit = risk_state.get("status") == "RISK_LOCKED"
@@ -2286,20 +2764,38 @@ def run_pnl() -> None:
                             )
                             state.set_json(
                                 f"live_position:{position.symbol}",
-                                {"symbol": position.symbol, "side": position.side, "status": "OPEN", "entry_price": position.entry_price, "current_price": current_price, "unrealized_pnl": position_unrealized, "stop_price": position.stop_price, "target_price": position.target_price, "ts": iso_now()},
+                                {"symbol": position.symbol, "side": position.side, "venue": venue, "status": "OPEN", "entry_price": position.entry_price, "current_price": current_price, "unrealized_pnl": position_unrealized, "stop_price": position.stop_price, "target_price": position.target_price, "ts": iso_now()},
                                 ex=180,
                             )
             except Exception:
-                unrealized = random.uniform(-350, 650)
-                realized = random.uniform(-150, 450)
+                previous = state.get_json("live_pnl") or {}
+                unrealized = float(previous.get("unrealized_pnl", 0.0) or 0.0)
+                realized = float(previous.get("realized_pnl", 0.0) or 0.0)
+                paper_unrealized = float(previous.get("paper_unrealized_pnl", unrealized) or 0.0)
+                paper_realized = float(previous.get("paper_realized_pnl", realized) or 0.0)
         else:
-            unrealized = random.uniform(-350, 650)
-            realized = random.uniform(-150, 450)
+            previous = state.get_json("live_pnl") or {}
+            unrealized = float(previous.get("unrealized_pnl", 0.0) or 0.0)
+            realized = float(previous.get("realized_pnl", 0.0) or 0.0)
+            paper_unrealized = float(previous.get("paper_unrealized_pnl", unrealized) or 0.0)
+            paper_realized = float(previous.get("paper_realized_pnl", realized) or 0.0)
         daily = realized + unrealized * 0.25
         equity = CFG.starting_equity + realized + unrealized
         equity_peak = max(equity_peak, equity)
         dd = max(0.0, (equity_peak - equity) / equity_peak * 100)
-        pnl = {"realized_pnl": realized, "unrealized_pnl": unrealized, "daily_pnl": daily, "equity": equity, "current_dd_pct": dd, "ts": iso_now()}
+        pnl = {
+            "realized_pnl": realized,
+            "unrealized_pnl": unrealized,
+            "paper_realized_pnl": paper_realized,
+            "paper_unrealized_pnl": paper_unrealized,
+            "live_realized_pnl": live_realized,
+            "live_unrealized_pnl": live_unrealized,
+            "daily_pnl": daily,
+            "equity": equity,
+            "current_dd_pct": dd,
+            "open_positions": open_count,
+            "ts": iso_now(),
+        }
         state.set_json("live_pnl", pnl, ex=90)
         state.publish("pnl_updates", pnl)
         db_execute(engine, "INSERT INTO pnl_snapshots(realized_pnl, unrealized_pnl, daily_pnl, equity, current_dd_pct, ts) VALUES(:realized_pnl, :unrealized_pnl, :daily_pnl, :equity, :current_dd_pct, :ts)", {**pnl, "ts": now_utc().replace(tzinfo=None)})
@@ -2430,6 +2926,22 @@ def process_deployment_request(engine: Engine, state: RedisState, request_row: A
                     text("INSERT INTO audit_log(event_type, actor, symbol, message, metadata_json, ts) VALUES('TESTNET_ORDER_FAILED', 'worker-order', :symbol, :message, :meta, :ts)"),
                     {"symbol": request_row.symbol, "message": reason, "meta": json.dumps(request_payload), "ts": ts},
                 )
+            journal_write(
+                engine,
+                state,
+                key=f"journal:{request_key}:TESTNET_ORDER_FAILED",
+                code="TESTNET_ORDER_FAILED",
+                actor="worker-order",
+                symbol=str(request_row.symbol),
+                side=str(request_row.side),
+                signal_key=str(request_row.signal_key or ""),
+                model_version=str(request_payload.get("ml_model_version", "")),
+                confidence=float(request_payload.get("ml_confidence", 0.0) or 0.0),
+                expected_reversion_bps=float(request_payload.get("expected_reversion_bps", 0.0) or 0.0),
+                features=signal_features(request_payload),
+                context={"reason": reason, "request_id": request_id, "mode": mode},
+                lesson={"action": "use_paper_until_testnet_execution_is_stable", "venue": "BINANCE_SPOT_TESTNET"},
+            )
             state.publish("risk_events", {"request_id": request_id, "symbol": request_row.symbol, "status": "BLOCKED", "reason": reason, "ts": iso_now()})
             return "BLOCKED"
 
@@ -2451,11 +2963,12 @@ def process_deployment_request(engine: Engine, state: RedisState, request_row: A
             {"order_id": order_id, "venue": mode, "symbol": request_row.symbol, "side": request_row.side, "price": price, "quantity": quantity, "fee": fee, "ts": ts},
         )
         conn.execute(
-            text("""INSERT INTO positions(symbol, side, entry_time, entry_price, size_usdt, quantity, stop_price, target_price, current_price, unrealized_pnl, realized_pnl, status, signal_id, rationale, updated_at)
-                    VALUES(:symbol, :side, :ts, :entry_price, :size, :quantity, :stop_price, :target_price, :current_price, 0, 0, 'OPEN', NULL, :rationale, :ts)"""),
+            text("""INSERT INTO positions(symbol, side, venue, entry_time, entry_price, size_usdt, quantity, stop_price, target_price, current_price, unrealized_pnl, realized_pnl, status, signal_id, rationale, updated_at)
+                    VALUES(:symbol, :side, :venue, :ts, :entry_price, :size, :quantity, :stop_price, :target_price, :current_price, 0, 0, 'OPEN', NULL, :rationale, :ts)"""),
             {
                 "symbol": request_row.symbol,
                 "side": request_row.side,
+                "venue": mode,
                 "ts": ts,
                 "entry_price": price,
                 "size": size_usdt,
@@ -2497,11 +3010,13 @@ def process_deployment_request(engine: Engine, state: RedisState, request_row: A
 def run_order() -> None:
     state, engine = RedisState(CFG), db_engine(CFG)
     init_schema(engine)
-    if engine is None:
-        while True:
-            heartbeat(engine, state, "worker-order", status="DEGRADED", detail={"reason": "MariaDB unavailable"})
-            time.sleep(10)
     while True:
+        if engine is None:
+            heartbeat(engine, state, "worker-order", status="DEGRADED", detail={"reason": "MariaDB unavailable", "phase": "reconnecting"})
+            time.sleep(10)
+            engine = db_engine(CFG)
+            init_schema(engine)
+            continue
         processed = {"EXECUTED": 0, "BLOCKED": 0, "LOCKED_BY_PEER": 0, "ERROR": 0}
         try:
             with engine.begin() as conn:
@@ -2515,8 +3030,10 @@ def run_order() -> None:
                 except Exception as exc:
                     processed["ERROR"] += 1
                     db_execute(engine, "INSERT INTO audit_log(event_type, actor, symbol, message, metadata_json, ts) VALUES('ORDER_WORKER_ERROR', 'worker-order', :symbol, :message, :meta, :ts)", {"symbol": getattr(row, "symbol", ""), "message": str(exc)[:500], "meta": "{}", "ts": now_utc().replace(tzinfo=None)})
-        except Exception:
+        except Exception as exc:
             processed["ERROR"] += 1
+            if isinstance(exc, SQLAlchemyError):
+                engine = None
         heartbeat(engine, state, "worker-order", detail=processed)
         time.sleep(3)
 
@@ -2527,6 +3044,7 @@ def run_ml() -> None:
     while True:
         try:
             heartbeat(engine, state, "worker-ml", status="ONLINE", detail={"phase": "training"})
+            evaluated_predictions = evaluate_pending_ml_predictions(engine, state)
             pieces = []
             for symbol in CFG.symbols:
                 frame = latest_candle_frame(state, symbol, CFG.strategy_interval, limit=CFG.ml_training_bars)
@@ -2536,7 +3054,8 @@ def run_ml() -> None:
                 if htf_frame is None:
                     htf_frame = fetch_binance_klines(symbol, CFG.higher_timeframe_interval, limit=max(120, CFG.ml_training_bars // 16))
                 if frame is None:
-                    frame = synthetic_ohlcv(symbol, bars=CFG.ml_training_bars)
+                    heartbeat(engine, state, "worker-ml", status="DEGRADED", detail={"phase": "training", "symbol": symbol, "reason": "live_training_frame_unavailable"})
+                    continue
                 candidates = training_candidates(symbol, frame, htf_frame)
                 if candidates.empty:
                     continue
@@ -2603,7 +3122,7 @@ def run_ml() -> None:
                 active_model = latest_active_model(engine)
                 promoted, reason = model_promotable(model, active_model, CFG)
                 persist_model_candidate(engine, state, model, "ACTIVE" if promoted else "REJECTED", reason)
-                heartbeat(engine, state, "worker-ml", status="ONLINE" if promoted else "DEGRADED", detail={"model_version": model["version"], "promotion": reason, "historical_rows": int(len(historical_training)), **model["metrics"]})
+                heartbeat(engine, state, "worker-ml", status="ONLINE" if promoted else "DEGRADED", detail={"model_version": model["version"], "promotion": reason, "historical_rows": int(len(historical_training)), "evaluated_predictions": evaluated_predictions, **model["metrics"]})
             else:
                 heartbeat(engine, state, "worker-ml", status="DEGRADED", detail={"reason": "insufficient_labeled_training_rows", "rows": int(len(training))})
         except Exception as exc:
@@ -2613,7 +3132,8 @@ def run_ml() -> None:
             nap = min(30, CFG.ml_retrain_seconds - slept)
             time.sleep(nap)
             slept += nap
-            heartbeat(engine, state, "worker-ml", status="ONLINE", detail={"phase": "waiting", "next_train_seconds": max(CFG.ml_retrain_seconds - slept, 0)})
+            evaluated_predictions = evaluate_pending_ml_predictions(engine, state, limit=100)
+            heartbeat(engine, state, "worker-ml", status="ONLINE", detail={"phase": "waiting", "next_train_seconds": max(CFG.ml_retrain_seconds - slept, 0), "evaluated_predictions": evaluated_predictions})
 
 
 def color_badge(label: str, status: str, tip: str) -> str:
@@ -2621,53 +3141,75 @@ def color_badge(label: str, status: str, tip: str) -> str:
     return f"<span title='{tip}' style='display:inline-block;padding:5px 9px;border-radius:6px;background:{colors.get(status, '#555')};color:white;font-size:12px;font-weight:700'>{label}</span>"
 
 
+def timeframe_price_change(state: RedisState, symbol: str, current_price: float, interval: str) -> dict[str, Any]:
+    frame = latest_candle_frame(state, symbol, interval, limit=2) if state.ok else None
+    if frame is None or frame.empty:
+        return {"timeframe_change_pct": 0.0, "timeframe_change_label": f"{interval} --", "timeframe_change_status": "AMBER"}
+    anchor_price = float(frame["open"].iloc[-1] or frame["close"].iloc[-1] or current_price)
+    change_pct = ((float(current_price) - anchor_price) / max(anchor_price, 1e-9)) * 100
+    if abs(change_pct) < 0.005:
+        status = "AMBER"
+    else:
+        status = "GREEN" if change_pct > 0 else "RED"
+    return {
+        "timeframe_change_pct": float(change_pct),
+        "timeframe_change_label": f"{interval} {change_pct:+.2f}%",
+        "timeframe_change_status": status,
+    }
+
+
 def demo_rows(state: RedisState) -> list[dict[str, Any]]:
     rows = []
     for symbol in CFG.symbols:
         price_cache_ok = False
         if state.ok:
-            price = state.get_json(f"latest_price:{symbol}") or {"price": simulated_price(symbol), "data_quality": "SIMULATED", "source": "CACHE_MISS", "ts": iso_now()}
-            price_cache_ok = fresh_payload(price, max(CFG.market_data_ws_stale_seconds, 180))
-            ob = state.get_json(f"latest_orderbook:{symbol}") or simulated_orderbook()
+            price = state.get_json(f"latest_price:{symbol}") or {"price": 0.0, "data_quality": "UNAVAILABLE", "source": "CACHE_MISS", "ts": iso_now()}
+            price_cache_ok = fresh_payload(price, max(CFG.market_data_ws_stale_seconds, 180)) and str(price.get("data_quality", "")).upper() == "LIVE"
+            ob = state.get_json(f"latest_orderbook:{symbol}") or unavailable_orderbook("UNAVAILABLE")
             cross_state = state.get_json(f"latest_cross_exchange:{symbol}")
         else:
-            price = {"price": simulated_price(symbol), "data_quality": "SIMULATED", "source": "NO_REDIS_CACHE", "ts": iso_now()}
-            ob = simulated_orderbook()
+            price = {"price": 0.0, "data_quality": "UNAVAILABLE", "source": "NO_REDIS_CACHE", "ts": iso_now()}
+            ob = unavailable_orderbook("UNAVAILABLE")
             cross_state = None
         if cross_state:
-            ob["cross_exchange_spread_bps"] = cross_state["cross_exchange_spread_bps"]
+            ob["cross_exchange_spread_bps"] = float(cross_state.get("cross_exchange_spread_bps", 0.0) or 0.0)
+        funding = state.get_json(f"latest_funding:{symbol}") if state.ok else None
+        oi = state.get_json(f"latest_open_interest:{symbol}") if state.ok else None
+        ob["funding_pressure"] = float(np.clip(float((funding or {}).get("funding_rate", 0.0)) * 6000, -1, 1))
+        ob["open_interest_signal"] = float(np.clip(float((oi or {}).get("oi_change", 0.0)) * 10, -1, 1))
         sig = state.get_json(f"latest_signal:{symbol}") if state.ok else None
         signal_is_stale = not fresh_payload(sig, max(CFG.market_data_ws_stale_seconds, 180)) if sig else True
-        if not sig or (price_cache_ok and signal_is_stale):
+        if not price_cache_ok:
+            sig = unavailable_signal(symbol, float(price.get("price", 0.0) or 0.0), "price_cache_unavailable")
+            sig["market_source"] = str(price.get("source", "CACHE_MISS"))
+        elif not sig or signal_is_stale:
             market_frame = latest_candle_frame(state, symbol, CFG.strategy_interval, limit=180) if state.ok else None
             sig = alpha_signal(symbol, float(price["price"]), ob, CFG, market_frame=market_frame, allow_live_fetch=False)
             sig["market_source"] = str(price.get("source", sig.get("market_source", "")))
             sig["market_data_quality"] = str(price.get("data_quality", sig.get("market_data_quality", "")))
-        elif price_cache_ok:
+        else:
             sig = dict(sig)
             sig["price"] = float(price["price"])
             sig["market_source"] = str(price.get("source", sig.get("market_source", "")))
             sig["market_data_quality"] = str(price.get("data_quality", sig.get("market_data_quality", "")))
             sig["ts"] = str(price.get("ts", sig.get("ts", iso_now())))
-        else:
-            sig = dict(sig)
-            sig["market_data_quality"] = "STALE_OR_SIMULATED"
-            sig["market_source"] = str(price.get("source", sig.get("market_source", "CACHE_STALE")))
-            sig["price"] = float(price.get("price", sig.get("price", simulated_price(symbol))))
         sig["market_price_ts"] = str(price.get("ts", ""))
         sig["market_cache_age_seconds"] = round(age_seconds(price.get("ts")), 1)
-        sig["market_cache_live"] = bool(price_cache_ok and str(price.get("data_quality", "")).upper() == "LIVE")
+        sig["market_cache_live"] = bool(price_cache_ok)
+        sig.update(timeframe_price_change(state, symbol, float(sig.get("price", price.get("price", 0.0)) or 0.0), CFG.strategy_interval))
         rows.append(sig)
     return rows
 
 
-def historical_chart(symbol: str) -> go.Figure:
-    frame = synthetic_ohlcv(symbol, bars=120)
-    idx = frame["time"]
-    prices = frame["close"]
+def historical_chart(state: RedisState, symbol: str) -> go.Figure:
+    frame = latest_candle_frame(state, symbol, CFG.strategy_interval, limit=120) if state.ok else None
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=idx, y=prices, mode="lines", name="price", line=dict(color="#2b6cb0")))
-    fig.add_trace(go.Scatter(x=idx.iloc[::17], y=prices.iloc[::17], mode="markers", name="signals", marker=dict(color="#16a34a", size=9)))
+    if frame is None or frame.empty:
+        fig.add_annotation(text="No live candle history available", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
+    else:
+        idx = frame["time"]
+        prices = frame["close"]
+        fig.add_trace(go.Scatter(x=idx, y=prices, mode="lines", name="price", line=dict(color="#2b6cb0")))
     fig.update_layout(height=280, margin=dict(l=10, r=10, t=20, b=10), template="plotly_white", legend=dict(orientation="h"))
     return fig
 
@@ -2734,6 +3276,167 @@ def journal_feedback_summary(engine: Engine | None) -> pd.DataFrame:
     return frame.drop(columns=["avg_return"])
 
 
+CONFIG_BLOCKERS = {"research_only", "symbol_not_whitelisted"}
+MARKET_BLOCKERS = {
+    "trend_regime_adx_high",
+    "low_participation",
+    "volatility_not_falling",
+    "expected_move_below_cost_hurdle",
+    "buy_rsi_not_oversold",
+    "sell_rsi_not_overbought",
+    "higher_timeframe_downtrend",
+    "higher_timeframe_uptrend",
+}
+EXECUTION_BLOCKERS = {"spread_too_wide", "slippage_too_high", "buy_orderbook_not_confirmed", "sell_orderbook_not_confirmed", "buy_taker_flow_not_confirmed", "sell_taker_flow_not_confirmed"}
+MODEL_BLOCKERS = {"ml_confidence_below_threshold", "confidence_too_low"}
+
+
+def journal_blocker_class(blocker: str) -> str:
+    if blocker in CONFIG_BLOCKERS:
+        return "Config gate"
+    if blocker in MODEL_BLOCKERS or blocker.startswith("ml_feature_drift:"):
+        return "Model gate"
+    if blocker in EXECUTION_BLOCKERS:
+        return "Execution gate"
+    if blocker in MARKET_BLOCKERS:
+        return "Market filter"
+    return "Other"
+
+
+def journal_blocker_action(blocker_class: str, blocker: str) -> str:
+    if blocker == "research_only":
+        return "Keep for production; ignore when measuring live edge availability."
+    if blocker == "symbol_not_whitelisted":
+        return "Expand whitelist only in training/paper mode if more coverage is needed."
+    if blocker == "expected_move_below_cost_hurdle":
+        return "Lower the training cost multiple cautiously or wait for larger dislocations."
+    if blocker == "trend_regime_adx_high":
+        return "Use a separate trend-aware bucket before relaxing this for real deployment."
+    if blocker == "ml_confidence_below_threshold":
+        return "Collect more labeled paper outcomes before raising model authority."
+    if blocker_class == "Execution gate":
+        return "Do not relax until spread/slippage evidence is stable."
+    return "Compare winners/losses for this feature bucket before changing thresholds."
+
+
+def journal_blocker_summary_rows(engine: Engine | None, limit: int = 500) -> pd.DataFrame:
+    rows = db_rows(engine, f"SELECT symbol, context_json FROM trading_journal WHERE journal_type IN ('SIGNAL','GATE') ORDER BY id DESC LIMIT {int(limit)}")
+    summary: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        context = safe_json_dict(row.get("context_json"))
+        blockers = context.get("blockers", [])
+        if not isinstance(blockers, list):
+            continue
+        symbol = str(row.get("symbol") or "")
+        for blocker in blockers:
+            name = str(blocker)
+            blocker_class = journal_blocker_class(name)
+            key = (blocker_class, name)
+            item = summary.setdefault(key, {"Class": blocker_class, "Blocker": name, "Events": 0, "Symbols": set(), "Suggested Action": journal_blocker_action(blocker_class, name)})
+            item["Events"] += 1
+            if symbol:
+                item["Symbols"].add(symbol)
+    output = []
+    for item in summary.values():
+        output.append({**item, "Symbols": ", ".join(sorted(item["Symbols"]))})
+    return pd.DataFrame(output).sort_values(["Events", "Class"], ascending=[False, True]).reset_index(drop=True) if output else pd.DataFrame(columns=["Class", "Blocker", "Events", "Symbols", "Suggested Action"])
+
+
+def journal_repeated_signal_rows(engine: Engine | None, limit: int = 500) -> pd.DataFrame:
+    rows = db_rows(engine, f"SELECT symbol, side, context_json, COUNT(*) events, MAX(created_at) last_seen FROM trading_journal WHERE journal_code IN ('SIG_HOLD','SIG_BUY','SIG_SELL','SIG_BLOCKED') GROUP BY symbol, side, context_json ORDER BY events DESC, last_seen DESC LIMIT {int(limit)}")
+    output = []
+    for row in rows:
+        context = safe_json_dict(row.get("context_json"))
+        blockers = context.get("blockers", [])
+        output.append(
+            {
+                "symbol": row.get("symbol", ""),
+                "side": row.get("side", ""),
+                "events": int(row.get("events") or 0),
+                "last_seen": row.get("last_seen"),
+                "blockers": ", ".join(str(item) for item in blockers[:6]) if isinstance(blockers, list) else str(blockers or ""),
+            }
+        )
+    return pd.DataFrame(output)
+
+
+def journal_freshness_rows(engine: Engine | None) -> pd.DataFrame:
+    rows = db_rows(
+        engine,
+        """SELECT journal_type, COUNT(*) events, MAX(created_at) last_seen,
+                  TIMESTAMPDIFF(SECOND, MAX(created_at), UTC_TIMESTAMP()) age_seconds
+           FROM trading_journal
+           GROUP BY journal_type
+           ORDER BY last_seen DESC""",
+    )
+    output = []
+    for row in rows:
+        age = int(row.get("age_seconds") or 0)
+        output.append(
+            {
+                "journal_type": row.get("journal_type", ""),
+                "events": int(row.get("events") or 0),
+                "last_seen": row.get("last_seen"),
+                "age": f"{age}s" if age < 3600 else f"{age // 3600}h {(age % 3600) // 60}m",
+                "status": "Fresh" if age <= 180 else "Quiet/deduped" if age <= 1800 else "Stale",
+            }
+        )
+    return pd.DataFrame(output)
+
+
+def journal_feedback_coverage_rows(engine: Engine | None) -> pd.DataFrame:
+    rows = db_rows(
+        engine,
+        """SELECT symbol, COUNT(*) labels, SUM(actual_outcome=1) wins, SUM(actual_outcome=0) losses,
+                  AVG(actual_return) avg_return, MAX(created_at) last_seen
+           FROM trading_journal
+           WHERE journal_type='FEEDBACK'
+           GROUP BY symbol
+           ORDER BY labels DESC""",
+    )
+    output = []
+    for row in rows:
+        labels = int(row.get("labels") or 0)
+        wins = int(row.get("wins") or 0)
+        output.append(
+            {
+                "symbol": row.get("symbol", ""),
+                "labels": labels,
+                "wins": wins,
+                "losses": int(row.get("losses") or 0),
+                "win_rate": f"{wins / max(labels, 1):.1%}",
+                "avg_return_bps": f"{float(row.get('avg_return') or 0.0) * 10000:.1f}",
+                "last_seen": row.get("last_seen"),
+                "coverage": "Concentrated" if labels >= 20 else "Thin",
+            }
+        )
+    missing = [symbol for symbol in CFG.symbols if symbol not in {str(row.get("symbol")) for row in rows}]
+    output.extend({"symbol": symbol, "labels": 0, "wins": 0, "losses": 0, "win_rate": "0.0%", "avg_return_bps": "0.0", "last_seen": "", "coverage": "Missing"} for symbol in missing)
+    return pd.DataFrame(output)
+
+
+def journal_model_diagnostic_rows(engine: Engine | None) -> pd.DataFrame:
+    rows = db_rows(engine, "SELECT created_at, context_json, lesson_json FROM trading_journal WHERE journal_code IN ('MODEL_REJECTED','MODEL_PROMOTED') ORDER BY id DESC LIMIT 10")
+    output = []
+    for row in rows:
+        context = safe_json_dict(row.get("context_json"))
+        metrics = safe_json_dict(context.get("metrics"))
+        output.append(
+            {
+                "created_at": row.get("created_at"),
+                "decision": context.get("status", ""),
+                "reason": context.get("reason", ""),
+                "rows": int(metrics.get("rows", 0) or 0),
+                "accuracy": f"{float(metrics.get('accuracy', 0) or 0):.1%}",
+                "precision": f"{float(metrics.get('precision', 0) or 0):.1%}",
+                "recall": f"{float(metrics.get('recall', 0) or 0):.1%}",
+                "positive_rate": f"{float(metrics.get('positive_rate', 0) or 0):.1%}",
+                "suggested_action": "Improve labels/features before promotion" if context.get("reason") else "",
+            }
+        )
+    return pd.DataFrame(output)
+
+
 def journal_export_rows(engine: Engine | None, limit: int = 1000) -> pd.DataFrame:
     if engine is None:
         return journal_rows(engine)
@@ -2788,16 +3491,28 @@ def journal_export_rows(engine: Engine | None, limit: int = 1000) -> pd.DataFram
 def journal_suggested_change(code: str, context: dict[str, Any], lesson: dict[str, Any]) -> str:
     blockers = context.get("blockers", [])
     blockers_text = " ".join(str(item) for item in blockers) if isinstance(blockers, list) else str(blockers)
+    if code == "SIG_HOLD" and ("research_only" in blockers_text or "symbol_not_whitelisted" in blockers_text):
+        return "Treat as config-gated noise; separate from market/model blocker analysis."
+    if code == "SIG_HOLD" and "expected_move_below_cost_hurdle" in blockers_text:
+        return "More trades require a lower training hurdle or waiting for larger dislocations."
+    if code == "SIG_HOLD" and "trend_regime_adx_high" in blockers_text:
+        return "Avoid production relaxation until trend-regime outcomes are measured separately."
+    if code == "SIG_HOLD" and "ml_confidence" in blockers_text:
+        return "Collect paper labels for this setup before trusting lower-confidence entries."
     if code == "SIG_BLOCKED" and "ml_confidence" in blockers_text:
         return "Review confidence threshold or improve labels for similar setups."
     if code == "SIG_BLOCKED" and "ml_feature_drift" in blockers_text:
         return "Do not deploy; retrain or normalize drifted feature before allowing this setup."
     if code == "ORDER_BLOCKED":
         return "Move repeated final-gate failures earlier into signal/risk filters."
+    if code == "TESTNET_ORDER_FAILED":
+        return "Use paper mode for training until testnet venue errors are resolved."
     if code == "OUTCOME_LOSS":
         return "Compare feature values with winners and reduce weight/size for this setup bucket."
     if code == "OUTCOME_WIN":
         return "Candidate pattern worth preserving; check if feature bucket has repeatable edge."
+    if code == "MISSED_PROFITABLE_CANDIDATE":
+        return "Review blockers that rejected a profitable candidate; adjust only after repeated evidence by blocker bucket."
     if code == "MODEL_REJECTED":
         return "Use rejection reason to improve labeling, features, or class balance before promotion."
     if code in {"SIG_BUY", "SIG_SELL"}:
@@ -2926,6 +3641,60 @@ def db_rows(engine: Engine | None, statement: str, params: dict[str, Any] | None
         return []
 
 
+def position_pnl_rows(engine: Engine | None, limit: int = 20) -> pd.DataFrame:
+    rows = db_rows(
+        engine,
+        f"""SELECT symbol, side, COALESCE(venue, 'PAPER') AS venue, entry_price, current_price, size_usdt, quantity,
+                  unrealized_pnl, realized_pnl, status, updated_at
+           FROM positions ORDER BY id DESC LIMIT {int(limit)}""",
+    )
+    output = []
+    for row in rows:
+        entry = float(row.get("entry_price") or 0.0)
+        current = float(row.get("current_price") or entry)
+        side = str(row.get("side") or "")
+        direction = 1 if side == "BUY" else -1
+        price_change_bps = ((current - entry) / max(entry, 1e-9)) * direction * 10000
+        size = float(row.get("size_usdt") or 0.0)
+        unrealized = float(row.get("unrealized_pnl") or 0.0)
+        output.append(
+            {
+                "symbol": row.get("symbol", ""),
+                "side": side,
+                "venue": str(row.get("venue") or "PAPER").upper(),
+                "status": row.get("status", ""),
+                "entry_price": entry,
+                "current_price": current,
+                "size_usdt": size,
+                "unrealized_pnl": unrealized,
+                "unrealized_bps": (unrealized / max(size, 1e-9)) * 10000,
+                "price_move_bps": price_change_bps,
+                "realized_pnl": float(row.get("realized_pnl") or 0.0),
+                "updated_at": row.get("updated_at", ""),
+            }
+        )
+    return pd.DataFrame(output)
+
+
+def position_pnl_summary(engine: Engine | None) -> dict[str, Any]:
+    frame = position_pnl_rows(engine, 100)
+    if frame.empty:
+        return {"paper_unrealized": 0.0, "paper_realized": 0.0, "live_unrealized": 0.0, "live_realized": 0.0, "open_exposure": 0.0, "open_positions": 0, "top_open": {}}
+    open_frame = frame[frame["status"].astype(str).str.upper().eq("OPEN")]
+    paper_frame = frame[~frame["venue"].astype(str).str.upper().eq("LIVE")]
+    live_frame = frame[frame["venue"].astype(str).str.upper().eq("LIVE")]
+    top_open = open_frame.iloc[0].to_dict() if not open_frame.empty else {}
+    return {
+        "paper_unrealized": float(paper_frame.loc[paper_frame["status"].astype(str).str.upper().eq("OPEN"), "unrealized_pnl"].sum()),
+        "paper_realized": float(paper_frame["realized_pnl"].sum()),
+        "live_unrealized": float(live_frame.loc[live_frame["status"].astype(str).str.upper().eq("OPEN"), "unrealized_pnl"].sum()),
+        "live_realized": float(live_frame["realized_pnl"].sum()),
+        "open_exposure": float(open_frame["size_usdt"].sum()) if not open_frame.empty else 0.0,
+        "open_positions": int(len(open_frame)),
+        "top_open": top_open,
+    }
+
+
 def performance_report(state: RedisState, engine: Engine | None) -> dict[str, Any]:
     pnl = state.get_json("live_pnl") or {}
     risk = state.get_json("risk_state") or {}
@@ -2962,11 +3731,9 @@ def performance_report(state: RedisState, engine: Engine | None) -> dict[str, An
         """SELECT created_at, stage, symbol, status, next_owner, reason
            FROM handoff_events ORDER BY id DESC LIMIT 12""",
     )
-    positions = db_rows(
-        engine,
-        """SELECT symbol, side, entry_price, current_price, size_usdt, unrealized_pnl, realized_pnl, status, updated_at
-           FROM positions ORDER BY id DESC LIMIT 10""",
-    )
+    position_frame = position_pnl_rows(engine, 10)
+    positions = position_frame.to_dict(orient="records") if not position_frame.empty else []
+    position_summary = position_pnl_summary(engine)
 
     order_counts = {
         "pending": int(db_scalar(engine, "SELECT COUNT(*) FROM deployment_requests WHERE status='PENDING'", default=0) or 0),
@@ -2993,6 +3760,10 @@ def performance_report(state: RedisState, engine: Engine | None) -> dict[str, An
         "pnl": {
             "realized": float(pnl.get("realized_pnl", 0.0) or 0.0),
             "unrealized": float(pnl.get("unrealized_pnl", 0.0) or 0.0),
+            "paper_realized": float(pnl.get("paper_realized_pnl", position_summary.get("paper_realized", 0.0)) or 0.0),
+            "paper_unrealized": float(pnl.get("paper_unrealized_pnl", position_summary.get("paper_unrealized", 0.0)) or 0.0),
+            "live_realized": float(pnl.get("live_realized_pnl", position_summary.get("live_realized", 0.0)) or 0.0),
+            "live_unrealized": float(pnl.get("live_unrealized_pnl", position_summary.get("live_unrealized", 0.0)) or 0.0),
             "daily": float(pnl.get("daily_pnl", 0.0) or 0.0),
             "equity": float(pnl.get("equity", CFG.starting_equity) or CFG.starting_equity),
             "drawdown_pct": float(pnl.get("current_dd_pct", 0.0) or 0.0),
@@ -3004,6 +3775,7 @@ def performance_report(state: RedisState, engine: Engine | None) -> dict[str, An
         "orders": order_counts,
         "journal": journal_counts,
         "open_positions": open_positions,
+        "position_pnl": position_summary,
         "active_model": active_model_payload,
         "latest_signals": latest_signals,
         "recent_orders": recent_orders,
@@ -3355,6 +4127,99 @@ def training_coverage_rows(engine: Engine | None) -> pd.DataFrame:
     return frame
 
 
+def model_learning_audit_rows(engine: Engine | None) -> pd.DataFrame:
+    latest = latest_model_candidate(engine)
+    metrics = latest.get("metrics", {}) if latest else {}
+    active = db_rows(engine, "SELECT version, trained_rows, trained_at FROM model_registry WHERE status='ACTIVE' ORDER BY trained_at DESC LIMIT 1")
+    predictions = db_rows(
+        engine,
+        """SELECT COUNT(*) total_predictions,
+                  SUM(actual_outcome IS NOT NULL) evaluated_predictions,
+                  AVG(confidence) avg_confidence,
+                  MAX(created_at) last_prediction
+           FROM ml_predictions
+           WHERE side IN ('BUY', 'SELL')""",
+    )
+    labels = db_rows(
+        engine,
+        """SELECT COUNT(*) labels,
+                  COUNT(DISTINCT symbol) symbols,
+                  AVG(label) positive_rate,
+                  AVG(forward_return) avg_return,
+                  MAX(ts) last_label
+           FROM trade_outcomes""",
+    )
+    prediction_row = predictions[0] if predictions else {}
+    label_row = labels[0] if labels else {}
+    total_predictions = int(prediction_row.get("total_predictions") or 0)
+    evaluated_predictions = int(prediction_row.get("evaluated_predictions") or 0)
+    active_row = active[0] if active else {}
+    return pd.DataFrame(
+        [
+            {
+                "check": "Active model",
+                "status": "PASS" if active_row else "BLOCKED",
+                "value": str(active_row.get("version", "none")),
+                "meaning": "Signals use a trained model only when a candidate is promoted to ACTIVE.",
+            },
+            {
+                "check": "Latest candidate",
+                "status": "PASS" if latest.get("status") == "ACTIVE" else "BLOCKED",
+                "value": f"{latest.get('status', 'none')} / {metrics.get('promotion_reason', 'waiting')}",
+                "meaning": f"Accuracy {float(metrics.get('accuracy', 0) or 0):.1%}, precision {float(metrics.get('precision', 0) or 0):.1%}, recall {float(metrics.get('recall', 0) or 0):.1%}.",
+            },
+            {
+                "check": "Historical labels",
+                "status": "PASS" if int(label_row.get("labels") or 0) >= CFG.ml_min_training_rows else "WAITING",
+                "value": f"{int(label_row.get('labels') or 0)} labels / {int(label_row.get('symbols') or 0)} symbols",
+                "meaning": f"Last label {label_row.get('last_label', '')}; avg return {float(label_row.get('avg_return') or 0) * 10000:.1f} bps.",
+            },
+            {
+                "check": "Prediction evaluation",
+                "status": "PASS" if evaluated_predictions > 0 else "WAITING",
+                "value": f"{evaluated_predictions}/{total_predictions} evaluated",
+                "meaning": "Live prediction rows are pending forward labels until the outcome horizon is reached and matched.",
+            },
+            {
+                "check": "Current inference mode",
+                "status": "WAITING" if not active_row else "PASS",
+                "value": "heuristic fallback" if not active_row else "trained model",
+                "meaning": "Without an ACTIVE model, confidence still exists but is heuristic, not learned authority.",
+            },
+        ]
+    )
+
+
+def prediction_coverage_rows(engine: Engine | None) -> pd.DataFrame:
+    rows = db_rows(
+        engine,
+        """SELECT symbol,
+                  COUNT(*) predictions,
+                  SUM(actual_outcome IS NOT NULL) evaluated,
+                  AVG(confidence) avg_confidence,
+                  MAX(created_at) last_prediction
+           FROM ml_predictions
+           WHERE side IN ('BUY', 'SELL')
+           GROUP BY symbol
+           ORDER BY predictions DESC""",
+    )
+    output = []
+    for row in rows:
+        predictions = int(row.get("predictions") or 0)
+        evaluated = int(row.get("evaluated") or 0)
+        output.append(
+            {
+                "symbol": row.get("symbol", ""),
+                "predictions": predictions,
+                "evaluated": evaluated,
+                "pending": predictions - evaluated,
+                "avg_confidence": f"{float(row.get('avg_confidence') or 0):.1%}",
+                "last_prediction": row.get("last_prediction", ""),
+            }
+        )
+    return pd.DataFrame(output)
+
+
 def rolling_validation_rows(engine: Engine | None) -> pd.DataFrame:
     predictions = prediction_learning_frame(engine, 5000)
     if predictions.empty:
@@ -3397,6 +4262,7 @@ def prediction_learning_frame(engine: Engine | None, limit: int = 1000) -> pd.Da
                   p.evaluated_at, p.created_at, o.label, o.forward_return
            FROM ml_predictions p
            LEFT JOIN trade_outcomes o ON o.idempotency_key = p.idempotency_key
+           WHERE p.side IN ('BUY', 'SELL')
            ORDER BY p.created_at DESC LIMIT {int(limit)}""",
     )
     parsed = []
@@ -3485,6 +4351,9 @@ def learning_health_summary(engine: Engine | None, rows: list[dict[str, Any]], m
     label_rows = db_rows(engine, "SELECT COUNT(*) rows_count, AVG(label) positive_rate, AVG(forward_return) avg_return FROM trade_outcomes WHERE ts >= DATE_SUB(UTC_TIMESTAMP(), INTERVAL 24 HOUR)")
     predictions = prediction_learning_frame(engine, 500)
     evaluated = predictions.dropna(subset=["actual_outcome"]) if not predictions.empty else predictions
+    prediction_counts = db_rows(engine, "SELECT COUNT(*) total_predictions, SUM(actual_outcome IS NOT NULL) evaluated_predictions FROM ml_predictions WHERE side IN ('BUY', 'SELL')")
+    total_predictions = int((prediction_counts[0].get("total_predictions") if prediction_counts else 0) or 0)
+    evaluated_predictions = int((prediction_counts[0].get("evaluated_predictions") if prediction_counts else 0) or 0)
     feature_count = int((feature_rows[0].get("rows_count") if feature_rows else 0) or 0)
     label_count = int((label_rows[0].get("rows_count") if label_rows else 0) or 0)
     conversion = label_count / max(feature_count, 1)
@@ -3494,12 +4363,18 @@ def learning_health_summary(engine: Engine | None, rows: list[dict[str, Any]], m
     evaluated_accuracy = float((evaluated["actual_outcome"].astype(int) == (evaluated["confidence"].astype(float) >= evaluated["threshold"].astype(float)).astype(int)).mean()) if not evaluated.empty else 0.0
     status = "GREEN"
     reasons: list[str] = []
+    if not model:
+        status = "RED"
+        reasons.append("no active promoted model; signals are using heuristic confidence")
     if float(latest_metrics.get("accuracy", 0) or 0) < CFG.ml_min_accuracy:
         status = "RED"
         reasons.append("accuracy below promotion threshold")
+    if total_predictions > 0 and evaluated_predictions == 0:
+        status = "RED"
+        reasons.append("live predictions are not yet evaluated against forward outcomes")
     if conversion < 0.10:
         status = "RED"
-        reasons.append("too few predictions are becoming labels")
+        reasons.append("feature snapshots are outpacing completed labels")
     if top_drift >= CFG.ml_drift_block_threshold:
         status = "RED"
         reasons.append("important live features drifted from training")
@@ -3513,6 +4388,8 @@ def learning_health_summary(engine: Engine | None, rows: list[dict[str, Any]], m
         "feature_rows_24h": feature_count,
         "labels_24h": label_count,
         "label_conversion": conversion,
+        "total_predictions": total_predictions,
+        "evaluated_predictions": evaluated_predictions,
         "evaluated_accuracy": evaluated_accuracy,
         "top_feature_drift": top_drift,
         "positive_rate_24h": float((label_rows[0].get("positive_rate") if label_rows else 0) or 0),
@@ -3602,15 +4479,17 @@ def slippage_vs_spread_chart(engine: Engine | None) -> go.Figure:
 def funding_oi_pressure_chart(engine: Engine | None, rows: list[dict[str, Any]]) -> go.Figure:
     db_signal_rows = db_rows(engine, "SELECT ts, symbol, funding_pressure, open_interest_signal FROM signals ORDER BY ts DESC LIMIT 300")
     frame = pd.DataFrame(db_signal_rows)
-    if frame.empty:
-        frame = pd.DataFrame([{"ts": iso_now(), "symbol": row.get("symbol"), "funding_pressure": row.get("funding_pressure", 0.0), "open_interest_signal": row.get("open_interest_signal", 0.0)} for row in rows])
-    frame["ts"] = pd.to_datetime(frame["ts"])
-    grouped = frame.sort_values("ts").set_index("ts")[["funding_pressure", "open_interest_signal"]].resample("15min").mean().dropna().reset_index()
-    if grouped.empty:
-        grouped = pd.DataFrame({"ts": [utc_naive_timestamp(pd.Timestamp.now(tz=UTC))], "funding_pressure": [0.0], "open_interest_signal": [0.0]})
     fig = go.Figure()
-    fig.add_trace(go.Scatter(x=grouped["ts"], y=grouped["funding_pressure"], mode="lines", name="Funding pressure", line=dict(color="#a78bfa", width=2)))
-    fig.add_trace(go.Scatter(x=grouped["ts"], y=grouped["open_interest_signal"], mode="lines", name="OI signal", line=dict(color="#38bdf8", width=2)))
+    if frame.empty:
+        fig.add_annotation(text="No live funding/OI signal history available", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
+    else:
+        frame["ts"] = pd.to_datetime(frame["ts"])
+        grouped = frame.sort_values("ts").set_index("ts")[["funding_pressure", "open_interest_signal"]].resample("15min").mean().dropna().reset_index()
+        if grouped.empty:
+            fig.add_annotation(text="No resampled funding/OI history available", x=0.5, y=0.5, xref="paper", yref="paper", showarrow=False)
+        else:
+            fig.add_trace(go.Scatter(x=grouped["ts"], y=grouped["funding_pressure"], mode="lines", name="Funding pressure", line=dict(color="#a78bfa", width=2)))
+            fig.add_trace(go.Scatter(x=grouped["ts"], y=grouped["open_interest_signal"], mode="lines", name="OI signal", line=dict(color="#38bdf8", width=2)))
     fig.update_yaxes(range=[-1.05, 1.05])
     return dark_figure(fig, height=250)
 
@@ -3737,11 +4616,15 @@ def scanner_radar_html(rows: list[dict[str, Any]]) -> str:
         source = html_lib.escape(str(row.get("market_source", "")).replace("wss://", "").replace("https://", "")[:42])
         cache_age = float(row.get("market_cache_age_seconds", 999999.0) or 999999.0)
         age_label = "no cache" if cache_age > 9999 else f"{cache_age:.0f}s old"
-        price_text = f"${float(row.get('price', 0) or 0):,.4f}" if row.get("market_cache_live") else "Awaiting cache"
+        price_value = float(row.get("price", 0) or 0)
+        price_text = f"${price_value:,.4f}" if price_value > 0 else "Awaiting cache"
+        change_status = str(row.get("timeframe_change_status", "AMBER"))
+        change_color = ui_status_color(change_status)
+        change_label = html_lib.escape(str(row.get("timeframe_change_label", f"{CFG.strategy_interval} --")))
         cards.append(
             f"<div class='scan-tile'>"
             f"<div class='scan-top'><b>{symbol}</b><span style='color:{color};border-color:{color}66;background:{color}1f'>{status}</span></div>"
-            f"<div class='scan-price'>{html_lib.escape(price_text)}</div>"
+            f"<div class='scan-price-row'><div class='scan-price'>{html_lib.escape(price_text)}</div><div class='scan-change' style='color:{change_color};background:{change_color}1f;border-color:{change_color}55'>{change_label}</div></div>"
             f"<div class='scan-meta'><span>Bias: {side}</span><span>ML {float(row.get('ml_confidence', 0) or 0):.2f}</span></div>"
             f"<div class='scan-meta'><span>Feed: {feed}</span><span>{html_lib.escape(age_label)}</span></div>"
             f"<div class='scan-source'>{source}</div>"
@@ -3821,9 +4704,42 @@ def render_scanner_command_center(st: Any, rows: list[dict[str, Any]], compact: 
             render_detail_table(st, "Scanner Timeline", scanner_timeline_rows(rows))
 
 
+def render_live_overview_scanner(st: Any, state: RedisState) -> None:
+    def render() -> None:
+        render_scanner_command_center(st, demo_rows(state), compact=True)
+
+    fragment = getattr(st, "fragment", None)
+    if callable(fragment):
+        @fragment(run_every="2s")
+        def live_scanner_fragment() -> None:
+            render()
+
+        live_scanner_fragment()
+    else:
+        render()
+
+
+def dataframe_display_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, float) and math.isnan(value):
+        return ""
+    if isinstance(value, (list, tuple, set)):
+        return ", ".join(str(item) for item in value)
+    if isinstance(value, dict):
+        return json.dumps(value, default=str, sort_keys=True)
+    missing = pd.isna(value)
+    if isinstance(missing, (bool, np.bool_)) and missing:
+        return ""
+    return str(value)
+
+
 def render_detail_table(st: Any, title: str, frame: pd.DataFrame) -> None:
     st.markdown(f"<div class='sb-panel-title'>{title}</div>", unsafe_allow_html=True)
-    st.dataframe(frame, width="stretch", hide_index=True)
+    display_frame = frame.copy()
+    for column in display_frame.select_dtypes(include=["object"]).columns:
+        display_frame[column] = display_frame[column].map(dataframe_display_value)
+    st.dataframe(display_frame, width="stretch", hide_index=True)
 
 
 def render_ui() -> None:
@@ -3918,7 +4834,9 @@ def render_ui() -> None:
         .scan-tile{border:1px solid #263750;border-radius:8px;background:linear-gradient(180deg,rgba(15,31,53,.92),rgba(10,21,36,.92));padding:12px;min-height:150px}
         .scan-top{display:flex;justify-content:space-between;align-items:center;gap:8px}
         .scan-top span{border:1px solid;border-radius:6px;padding:2px 7px;font-size:.72rem;font-weight:800}
-        .scan-price{font-size:1.35rem;font-weight:800;color:#f8fafc;margin-top:8px}
+        .scan-price-row{display:flex;align-items:flex-end;justify-content:space-between;gap:8px;margin-top:8px;min-height:32px}
+        .scan-price{font-size:1.35rem;font-weight:800;color:#f8fafc;line-height:1}
+        .scan-change{border:1px solid;border-radius:6px;padding:3px 7px;font-size:.72rem;font-weight:800;white-space:nowrap;line-height:1.05}
         .scan-meta{display:flex;justify-content:space-between;gap:8px;color:#b6c6dc;font-size:.76rem;margin-top:6px}
         .scan-source{color:#64748b;font-size:.68rem;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
         .scan-bar{height:7px;background:#111827;border-radius:999px;margin-top:10px;overflow:hidden;border:1px solid #263750}
@@ -3956,7 +4874,7 @@ def render_ui() -> None:
         return
 
     df = pd.DataFrame(rows)
-    scanner_cols = ["symbol", "candidate_side", "side", "price", "market_data_quality", "market_source", "market_cache_age_seconds", "strategy_interval", "z_score", "rsi", "volume_z", "adx", "expected_reversion_bps", "ml_confidence", "ml_model_version", "obi", "cross_exchange_spread_bps", "model_slippage_bps", "funding_pressure", "open_interest_signal", "win_p_est", "payoff_b", "kelly_fraction", "suggested_usdt", "research_only", "deployable", "deployment_blockers", "rationale"]
+    scanner_cols = ["symbol", "candidate_side", "side", "price", "timeframe_change_pct", "timeframe_change_label", "market_data_quality", "market_source", "market_cache_age_seconds", "strategy_interval", "z_score", "rsi", "volume_z", "adx", "expected_reversion_bps", "ml_confidence", "ml_model_version", "obi", "cross_exchange_spread_bps", "model_slippage_bps", "funding_pressure", "open_interest_signal", "win_p_est", "payoff_b", "kelly_fraction", "suggested_usdt", "research_only", "deployable", "deployment_blockers", "rationale"]
     alerts = overview_alerts(rows, validation, report, risk, drift)
 
     header_left, header_right = st.columns([2.4, 1])
@@ -3997,7 +4915,7 @@ def render_ui() -> None:
         for col, spec in zip(card_cols, card_specs):
             col.markdown(ui_card(*spec), unsafe_allow_html=True)
 
-        render_scanner_command_center(st, rows, compact=True)
+        render_live_overview_scanner(st, state)
 
         left, mid, right = st.columns([1.05, 1.35, .72])
         with left:
@@ -4074,10 +4992,24 @@ def render_ui() -> None:
         st.subheader("Signals")
         st.markdown(f"Current interpretation: **{signal_reason}**")
         render_detail_table(st, "Latest Scanner Signals", df[scanner_cols])
-        st.plotly_chart(historical_chart(selected), width="stretch")
+        st.plotly_chart(historical_chart(state, selected), width="stretch")
 
     elif page == "Performance":
         st.subheader("Performance")
+        report_pnl = report.get("pnl", {})
+        position_summary = report.get("position_pnl", {})
+        top_open = position_summary.get("top_open") or {}
+        live_cols = st.columns(5)
+        live_specs = [
+            ("Paper Open P&L", format_money(report_pnl.get("paper_unrealized", position_summary.get("paper_unrealized", 0.0))), "Simulated open positions", pnl_status(report_pnl.get("paper_unrealized", 0.0))),
+            ("Paper Realized", format_money(report_pnl.get("paper_realized", position_summary.get("paper_realized", 0.0))), "Closed paper/testnet positions", pnl_status(report_pnl.get("paper_realized", 0.0))),
+            ("Live Open P&L", format_money(report_pnl.get("live_unrealized", position_summary.get("live_unrealized", 0.0))), "Real exchange positions only", pnl_status(report_pnl.get("live_unrealized", 0.0))),
+            ("Open Exposure", format_money(position_summary.get("open_exposure", 0.0)), f"{int(position_summary.get('open_positions', 0) or 0)} open position(s)", "GREEN" if float(position_summary.get("open_exposure", 0.0) or 0.0) <= CFG.max_position_usdt * max(int(position_summary.get("open_positions", 0) or 0), 1) else "AMBER"),
+            ("Focus Position", str(top_open.get("symbol", "None")), f"{top_open.get('venue', '')} {format_money(top_open.get('unrealized_pnl', 0.0))} / {float(top_open.get('unrealized_bps', 0.0) or 0.0):.1f} bps" if top_open else "No open position", pnl_status(top_open.get("unrealized_pnl", 0.0) if top_open else 0.0)),
+        ]
+        for col, spec in zip(live_cols, live_specs):
+            col.markdown(ui_card(*spec), unsafe_allow_html=True)
+        render_detail_table(st, "Current Position P&L", pd.DataFrame(report.get("positions", [])))
         perf_cols = st.columns(5)
         for col, (label, value) in zip(
             perf_cols,
@@ -4101,12 +5033,13 @@ def render_ui() -> None:
         latest_reason = str(latest_candidate_metrics.get("promotion_reason", "")) or "waiting_for_training"
         learning = learning_health_summary(engine, rows, model, latest_candidate)
         drift_rows = feature_drift_rows(engine, rows, model, latest_candidate)
+        active_model_label = str(model.get("version", "none")) if model else "none"
         c1, c2, c3, c4, c5 = st.columns(5)
         c1.markdown(ui_card("Learning State", plain_status(learning["status"]), learning["inference"], learning["status"]), unsafe_allow_html=True)
-        c2.markdown(ui_card("Label Conversion", f"{learning['label_conversion']:.1%}", f"{learning['labels_24h']} labels / {learning['feature_rows_24h']} features", "GREEN" if learning["label_conversion"] >= 0.10 else "RED"), unsafe_allow_html=True)
+        c2.markdown(ui_card("Active Model", active_model_label, "Promoted model in use" if model else "Heuristic fallback only", "GREEN" if model else "RED"), unsafe_allow_html=True)
         c3.markdown(ui_card("Latest Accuracy", f"{latest_accuracy:.1%}", f"Target {CFG.ml_min_accuracy:.0%}", "GREEN" if latest_accuracy >= CFG.ml_min_accuracy else "RED"), unsafe_allow_html=True)
-        c4.markdown(ui_card("Top Drift", f"{learning['top_feature_drift']:.1f}", f"Block at {CFG.ml_drift_block_threshold:.1f}", "GREEN" if learning["top_feature_drift"] < CFG.ml_drift_warning_threshold else "RED" if learning["top_feature_drift"] >= CFG.ml_drift_block_threshold else "AMBER"), unsafe_allow_html=True)
-        c5.markdown(ui_card("Confidence Gate", f"{model_conf:.2f}", f"Target {CFG.min_ml_confidence:.2f}", "GREEN" if model_conf >= CFG.min_ml_confidence else "AMBER"), unsafe_allow_html=True)
+        c4.markdown(ui_card("Prediction Labels", f"{learning['evaluated_predictions']}/{learning['total_predictions']}", "Evaluated live predictions", "GREEN" if learning["evaluated_predictions"] > 0 else "RED"), unsafe_allow_html=True)
+        c5.markdown(ui_card("Top Drift", f"{learning['top_feature_drift']:.1f}", f"Block at {CFG.ml_drift_block_threshold:.1f}", "GREEN" if learning["top_feature_drift"] < CFG.ml_drift_warning_threshold else "RED" if learning["top_feature_drift"] >= CFG.ml_drift_block_threshold else "AMBER"), unsafe_allow_html=True)
         st.markdown(
             ui_panel(
                 "Current Inference",
@@ -4128,6 +5061,11 @@ def render_ui() -> None:
                 ),
                 unsafe_allow_html=True,
             )
+        audit_left, audit_right = st.columns([1.15, 1])
+        with audit_left:
+            render_detail_table(st, "Learning Usefulness Audit", model_learning_audit_rows(engine))
+        with audit_right:
+            render_detail_table(st, "Prediction Coverage by Symbol", prediction_coverage_rows(engine))
         l1, l2, l3 = st.columns([1.05, 1, 1])
         with l1:
             st.plotly_chart(model_learning_chart(engine, rows), width="stretch")
@@ -4178,16 +5116,36 @@ def render_ui() -> None:
         st.markdown("Structured entries explain what the system saw, why it acted or blocked, and what later outcomes taught the model.")
         journal = report.get("journal", {})
         export_frame = journal_export_rows(engine)
-        jc = st.columns(3)
+        blocker_frame = journal_blocker_summary_rows(engine)
+        freshness_frame = journal_freshness_rows(engine)
+        coverage_frame = journal_feedback_coverage_rows(engine)
+        model_diag_frame = journal_model_diagnostic_rows(engine)
+        approved_actions_frame = approved_journal_action_rows(engine)
+        config_noise = int(blocker_frame.loc[blocker_frame["Class"].eq("Config gate"), "Events"].sum()) if not blocker_frame.empty else 0
+        market_filters = int(blocker_frame.loc[blocker_frame["Class"].eq("Market filter"), "Events"].sum()) if not blocker_frame.empty else 0
+        missing_feedback = int((coverage_frame["coverage"] == "Missing").sum()) if not coverage_frame.empty and "coverage" in coverage_frame.columns else 0
+        jc = st.columns(6)
         jc[0].markdown(ui_card("Journal Events", str(journal.get("total_7d", 0)), "Last 7 days", "GREEN" if int(journal.get("total_7d", 0) or 0) > 0 else "AMBER"), unsafe_allow_html=True)
         jc[1].markdown(ui_card("Buy Signals", str(journal.get("buy_signals_7d", 0)), "Auto SIG_BUY entries", "GREEN" if int(journal.get("buy_signals_7d", 0) or 0) > 0 else "AMBER"), unsafe_allow_html=True)
         jc[2].markdown(ui_card("Outcome Feedback", str(journal.get("feedback_7d", 0)), "Win/loss feedback labels", "GREEN" if int(journal.get("feedback_7d", 0) or 0) > 0 else "AMBER"), unsafe_allow_html=True)
+        jc[3].markdown(ui_card("Config Noise", str(config_noise), "Research/whitelist gates", "AMBER" if config_noise else "GREEN"), unsafe_allow_html=True)
+        jc[4].markdown(ui_card("Market Filters", str(market_filters), "ADX/volume/cost gates", "AMBER" if market_filters else "GREEN"), unsafe_allow_html=True)
+        jc[5].markdown(ui_card("Missing Labels", str(missing_feedback), "Symbols without feedback", "AMBER" if missing_feedback else "GREEN"), unsafe_allow_html=True)
         st.download_button(
             "Download Journal for Excel",
             data=journal_excel_bytes(export_frame),
             file_name=f"horizon_trading_journal_{datetime.now().strftime('%Y%m%d_%H%M%S')}.xls",
             mime="application/vnd.ms-excel",
         )
+        d1, d2 = st.columns([1.15, 1])
+        with d1:
+            render_detail_table(st, "Blocker Taxonomy", blocker_frame.head(15))
+            render_detail_table(st, "Repeated Signal States", journal_repeated_signal_rows(engine, 20))
+        with d2:
+            render_detail_table(st, "Journal Freshness", freshness_frame)
+            render_detail_table(st, "Feedback Coverage by Symbol", coverage_frame)
+            render_detail_table(st, "Model Decision Diagnostics", model_diag_frame)
+        render_detail_table(st, "Approved Journal Actions", approved_actions_frame)
         j1, j2, j3 = st.columns([1, 1, 1.15])
         with j1:
             st.markdown("<div class='sb-panel-title'>What Is Being Journaled</div>", unsafe_allow_html=True)
@@ -4244,14 +5202,15 @@ def render_ui() -> None:
 
     elif page == "Funding & PnL":
         st.subheader("Funding and P&L")
+        report_pnl = report.get("pnl", {})
         p = st.columns(5)
         for col, (label, value, status) in zip(
             p,
             [
-                ("Realized P&L", f"${float(pnl.get('realized_pnl', 0) or 0):,.0f}", "GREEN"),
-                ("Unrealized P&L", f"${float(pnl.get('unrealized_pnl', 0) or 0):,.0f}", "GREEN"),
-                ("Daily P&L", f"${float(pnl.get('daily_pnl', 0) or 0):,.0f}", "GREEN" if float(pnl.get("daily_pnl", 0) or 0) >= 0 else "RED"),
-                ("Equity", f"${float(pnl.get('equity', CFG.starting_equity) or CFG.starting_equity):,.0f}", "GREEN"),
+                ("Paper P&L", format_money(report_pnl.get("paper_unrealized", pnl.get("unrealized_pnl", 0.0))), pnl_status(report_pnl.get("paper_unrealized", pnl.get("unrealized_pnl", 0.0)))),
+                ("Live P&L", format_money(report_pnl.get("live_unrealized", 0.0)), pnl_status(report_pnl.get("live_unrealized", 0.0))),
+                ("Daily P&L", format_money(report_pnl.get("daily", pnl.get("daily_pnl", 0.0))), pnl_status(report_pnl.get("daily", pnl.get("daily_pnl", 0.0)))),
+                ("Equity", format_money(report_pnl.get("equity", pnl.get("equity", CFG.starting_equity)), 2), "GREEN"),
                 ("Funding Pressure", f"{best['funding_pressure']:.2f}", "AMBER" if abs(best["funding_pressure"]) > 0.4 else "GREEN"),
             ],
         ):
