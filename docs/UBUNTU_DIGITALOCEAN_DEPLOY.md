@@ -122,11 +122,12 @@ The UI is optional. Backend performance can be checked from the prompt:
 cd /home/myts/superbot
 bash scripts/horizonctl.sh performance
 bash scripts/horizonctl.sh performance-json
+bash scripts/horizonctl.sh market-check
 bash scripts/horizonctl.sh validate-once
 bash scripts/horizonctl.sh test-headless
 ```
 
-The report includes equity, daily P&L, realized/unrealized P&L, drawdown, risk state, drift state, worker heartbeats, order counts, open positions, active ML model metrics, recent signals, recent orders, validation state, and recent handoffs. `test-headless` verifies that the backend can run without Streamlit while preserving validation, journal, handoff, and order-gate data.
+The report includes equity, daily P&L, realized/unrealized P&L, drawdown, risk state, drift state, worker heartbeats, order counts, open positions, active ML model metrics, recent signals, recent orders, validation state, and recent handoffs. `market-check` verifies the configured Binance Spot Testnet REST and websocket market feed. `test-headless` verifies that the backend can run without Streamlit while preserving validation, journal, handoff, and order-gate data.
 
 ## 9. Logs
 

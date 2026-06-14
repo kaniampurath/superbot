@@ -7,9 +7,12 @@ import hmac
 import math
 import os
 import random
+import ssl
 import socket
 import sys
+import threading
 import time
+from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -21,6 +24,7 @@ import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import requests
+import websocket
 from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.engine import Engine
@@ -170,6 +174,16 @@ class Config:
     slippage_bps: float = env_float("SLIPPAGE_BPS", 5)
     paper_trading: bool = env_bool("PAPER_TRADING", True)
     enable_real_testnet_orders: bool = env_bool("ENABLE_REAL_TESTNET_ORDERS", True)
+    market_data_source: str = env_str("MARKET_DATA_SOURCE", "TESTNET_WS").strip().upper()
+    binance_rest_base_url: str = env_str("BINANCE_REST_BASE_URL", "https://testnet.binance.vision").rstrip("/")
+    binance_ws_base_url: str = env_str("BINANCE_WS_BASE_URL", "wss://stream.testnet.binance.vision:9443").rstrip("/")
+    market_data_intervals: tuple[str, ...] = tuple(s.strip() for s in env_str("MARKET_DATA_INTERVALS", "1m,5m,15m").split(",") if s.strip())
+    market_data_history_limit: int = env_int("MARKET_DATA_HISTORY_LIMIT", 500)
+    market_data_rest_backfill_seconds: int = env_int("MARKET_DATA_REST_BACKFILL_SECONDS", 900)
+    market_data_ws_stale_seconds: int = env_int("MARKET_DATA_WS_STALE_SECONDS", 90)
+    market_data_ws_reconnect_seconds: int = env_int("MARKET_DATA_WS_RECONNECT_SECONDS", 10)
+    market_data_trust_env_proxy: bool = env_bool("MARKET_DATA_TRUST_ENV_PROXY", False)
+    binance_verify_tls: bool = env_bool("BINANCE_VERIFY_TLS", True)
 
 
 CFG = Config()
@@ -493,20 +507,51 @@ def simulated_price(symbol: str) -> float:
     return round(base * (1 + drift + noise), 4)
 
 
+def binance_session() -> requests.Session:
+    session = requests.Session()
+    session.trust_env = CFG.market_data_trust_env_proxy
+    return session
+
+
+@contextmanager
+def market_proxy_environment() -> Any:
+    if CFG.market_data_trust_env_proxy:
+        yield
+        return
+    keys = ["HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "http_proxy", "https_proxy", "all_proxy"]
+    prior = {key: os.environ.get(key) for key in keys}
+    try:
+        for key in keys:
+            os.environ.pop(key, None)
+        yield
+    finally:
+        for key, value in prior.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def binance_rest_url(path: str) -> str:
+    return f"{CFG.binance_rest_base_url}{path}"
+
+
+def binance_get(path: str, params: dict[str, Any] | None = None, timeout: int = 5) -> Any:
+    response = binance_session().get(binance_rest_url(path), params=params or {}, timeout=timeout, verify=CFG.binance_verify_tls)
+    response.raise_for_status()
+    return response.json()
+
+
 def fetch_binance_price(symbol: str) -> tuple[float, str]:
     try:
-        response = requests.get("https://api.binance.com/api/v3/ticker/price", params={"symbol": symbol}, timeout=3)
-        response.raise_for_status()
-        return float(response.json()["price"]), "LIVE"
+        return float(binance_get("/api/v3/ticker/price", {"symbol": symbol}, timeout=3)["price"]), "LIVE"
     except Exception:
         return simulated_price(symbol), "SIMULATED"
 
 
 def fetch_binance_klines(symbol: str, interval: str, limit: int = 180) -> pd.DataFrame | None:
     try:
-        response = requests.get("https://api.binance.com/api/v3/klines", params={"symbol": symbol, "interval": interval, "limit": limit}, timeout=5)
-        response.raise_for_status()
-        rows = response.json()
+        rows = binance_get("/api/v3/klines", {"symbol": symbol, "interval": interval, "limit": limit}, timeout=5)
         columns = [
             "open_time",
             "open",
@@ -528,6 +573,86 @@ def fetch_binance_klines(symbol: str, interval: str, limit: int = 180) -> pd.Dat
         return frame[["time", "open", "high", "low", "close", "volume", "quote_volume", "taker_buy_base", "taker_buy_quote"]]
     except Exception:
         return None
+
+
+def candle_frame_to_payload(symbol: str, interval: str, frame: pd.DataFrame, source: str, closed: bool = True) -> dict[str, Any]:
+    if frame is None or frame.empty:
+        rows: list[dict[str, Any]] = []
+    else:
+        clean = frame.tail(max(CFG.market_data_history_limit, 50)).copy()
+        clean["time"] = pd.to_datetime(clean["time"], utc=True).dt.tz_convert(None)
+        rows = [
+            {
+                "time": pd.Timestamp(row.time).isoformat(),
+                "open": float(row.open),
+                "high": float(row.high),
+                "low": float(row.low),
+                "close": float(row.close),
+                "volume": float(row.volume),
+                "quote_volume": float(getattr(row, "quote_volume", 0.0) or 0.0),
+                "taker_buy_quote": float(getattr(row, "taker_buy_quote", 0.0) or 0.0),
+            }
+            for row in clean.itertuples(index=False)
+        ]
+    return {"symbol": symbol, "interval": interval, "source": source, "closed": closed, "rows": rows, "ts": iso_now()}
+
+
+def candle_payload_to_frame(payload: dict[str, Any] | None) -> pd.DataFrame | None:
+    if not payload or not payload.get("rows"):
+        return None
+    frame = pd.DataFrame(payload["rows"])
+    if frame.empty:
+        return None
+    frame["time"] = pd.to_datetime(frame["time"], utc=True).dt.tz_convert(None)
+    for column in ["open", "high", "low", "close", "volume", "quote_volume", "taker_buy_quote"]:
+        if column not in frame.columns:
+            frame[column] = 0.0
+        frame[column] = frame[column].astype(float)
+    return frame[["time", "open", "high", "low", "close", "volume", "quote_volume", "taker_buy_quote"]].sort_values("time").reset_index(drop=True)
+
+
+def aggregate_candles(frame: pd.DataFrame, interval: str) -> pd.DataFrame:
+    if frame is None or frame.empty:
+        return pd.DataFrame()
+    if interval == "1m":
+        return frame.tail(CFG.market_data_history_limit).reset_index(drop=True)
+    rule = {"5m": "5min", "15m": "15min"}.get(interval)
+    if not rule:
+        return frame.tail(CFG.market_data_history_limit).reset_index(drop=True)
+    grouped = frame.copy()
+    grouped["bucket"] = pd.to_datetime(grouped["time"]).dt.floor(rule)
+    result = (
+        grouped.groupby("bucket", as_index=False)
+        .agg(
+            open=("open", "first"),
+            high=("high", "max"),
+            low=("low", "min"),
+            close=("close", "last"),
+            volume=("volume", "sum"),
+            quote_volume=("quote_volume", "sum"),
+            taker_buy_quote=("taker_buy_quote", "sum"),
+        )
+        .rename(columns={"bucket": "time"})
+    )
+    return result.tail(CFG.market_data_history_limit).reset_index(drop=True)
+
+
+def latest_candle_frame(state: RedisState, symbol: str, interval: str, limit: int = 180) -> pd.DataFrame | None:
+    frame = candle_payload_to_frame(state.get_json(f"latest_klines:{symbol}:{interval}") if state.ok else None)
+    if frame is None or frame.empty:
+        return None
+    return frame.tail(limit).reset_index(drop=True)
+
+
+def store_candle_frames(state: RedisState, symbol: str, one_minute_frame: pd.DataFrame, source: str, closed: bool = True) -> None:
+    if one_minute_frame is None or one_minute_frame.empty:
+        return
+    for interval in CFG.market_data_intervals:
+        frame = aggregate_candles(one_minute_frame, interval)
+        payload = candle_frame_to_payload(symbol, interval, frame, source=source, closed=closed)
+        state.set_json(f"latest_klines:{symbol}:{interval}", payload, ex=max(CFG.market_data_rest_backfill_seconds * 3, 1800))
+        state.set_json(f"latest_kline:{symbol}:{interval}", payload, ex=max(CFG.market_data_rest_backfill_seconds * 3, 1800))
+        state.publish("kline_updates", payload)
 
 
 def simulated_orderbook() -> dict[str, Any]:
@@ -634,9 +759,7 @@ def cross_exchange_state(symbol: str, binance_price: float) -> dict[str, Any]:
 
 def fetch_orderbook(symbol: str) -> dict[str, Any]:
     try:
-        response = requests.get("https://api.binance.com/api/v3/depth", params={"symbol": symbol, "limit": 20}, timeout=3)
-        response.raise_for_status()
-        data = response.json()
+        data = binance_get("/api/v3/depth", {"symbol": symbol, "limit": 20}, timeout=3)
         bids = [(float(p), float(q)) for p, q in data.get("bids", [])]
         asks = [(float(p), float(q)) for p, q in data.get("asks", [])]
         if not bids or not asks:
@@ -688,7 +811,7 @@ def fetch_orderbook(symbol: str) -> dict[str, Any]:
         return simulated_orderbook()
 
 
-def alpha_signal(symbol: str, price: float, orderbook: dict[str, Any], cfg: Config, market_frame: pd.DataFrame | None = None, allow_live_fetch: bool = True) -> dict[str, Any]:
+def alpha_signal(symbol: str, price: float, orderbook: dict[str, Any], cfg: Config, market_frame: pd.DataFrame | None = None, htf_frame: pd.DataFrame | None = None, allow_live_fetch: bool = True) -> dict[str, Any]:
     frame = market_frame if market_frame is not None and len(market_frame) >= 80 else synthetic_ohlcv(symbol, bars=180)
     indicators = add_indicators(frame)
     latest = indicators.iloc[-1] if not indicators.empty else pd.Series({"z": 0.0, "rsi": 50.0, "vol_z": 0.0, "ema20": price, "ema50": price, "taker_buy_ratio": 0.5, "adx": 99.0, "realized_vol_fast": 1.0, "realized_vol_slow": 0.0, "expected_reversion_bps": 0.0})
@@ -702,7 +825,7 @@ def alpha_signal(symbol: str, price: float, orderbook: dict[str, Any], cfg: Conf
     realized_vol_slow = float(latest.get("realized_vol_slow", 0.0))
     realized_vol_ratio = realized_vol_fast / max(realized_vol_slow, 1e-9)
     expected_reversion_bps = float(latest.get("expected_reversion_bps", 0.0))
-    htf = fetch_binance_klines(symbol, cfg.higher_timeframe_interval, limit=120) if allow_live_fetch else None
+    htf = htf_frame if htf_frame is not None and len(htf_frame) >= 80 else fetch_binance_klines(symbol, cfg.higher_timeframe_interval, limit=120) if allow_live_fetch else None
     htf_indicators = add_indicators(htf) if htf is not None and len(htf) >= 80 else pd.DataFrame()
     htf_latest = htf_indicators.iloc[-1] if not htf_indicators.empty else None
     htf_trend = 0.0 if htf_latest is None else float((htf_latest["ema20"] - htf_latest["ema50"]) / max(float(htf_latest["close"]), 1e-9))
@@ -792,6 +915,8 @@ def alpha_signal(symbol: str, price: float, orderbook: dict[str, Any], cfg: Conf
         "open_interest_signal": oi_signal,
         "model_slippage_bps": float(side_slippage if side != "HOLD" else orderbook.get("model_slippage_bps", 0.0)),
         "spread_bps": float(orderbook["spread_bps"]),
+        "market_source": "CANDLE_BUFFER" if market_frame is not None and len(market_frame) >= 80 else "SYNTHETIC_OR_REST",
+        "market_data_quality": str(orderbook.get("data_quality", "UNKNOWN")),
         "ml_confidence": 0.0,
         "ml_model_version": "not_scored",
         "win_p_est": win_p,
@@ -1413,7 +1538,10 @@ def monte_carlo_summary(trades: pd.DataFrame, paths: int = 250) -> dict[str, Any
 
 
 def validation_snapshot(symbol: str, allow_live_fetch: bool = True) -> dict[str, Any]:
-    frame = fetch_binance_klines(symbol, CFG.strategy_interval, limit=CFG.validation_backtest_bars) if allow_live_fetch else None
+    state = RedisState(CFG) if allow_live_fetch else RedisState(CFG)
+    frame = latest_candle_frame(state, symbol, CFG.strategy_interval, limit=CFG.validation_backtest_bars) if state.ok else None
+    if frame is None and allow_live_fetch:
+        frame = fetch_binance_klines(symbol, CFG.strategy_interval, limit=CFG.validation_backtest_bars)
     if frame is None:
         frame = synthetic_ohlcv(symbol, bars=CFG.validation_backtest_bars)
     trades = run_backtest_for_frame(symbol, frame)
@@ -1641,21 +1769,94 @@ def run_validation() -> None:
         time.sleep(max(30, CFG.validation_worker_seconds - elapsed))
 
 
-def run_marketdata() -> None:
-    state, engine = RedisState(CFG), db_engine(CFG)
-    init_schema(engine)
-    while True:
+def run_marketdata_rest_poll(state: RedisState, engine: Engine) -> None:
+    for symbol in CFG.symbols:
+        price, quality = fetch_binance_price(symbol)
+        tick = {"symbol": symbol, "price": price, "source": CFG.binance_rest_base_url, "data_quality": quality, "ts": iso_now()}
+        frame = fetch_binance_klines(symbol, "1m", limit=CFG.market_data_history_limit)
+        if frame is not None and not frame.empty:
+            store_candle_frames(state, symbol, frame, source=f"{CFG.binance_rest_base_url}:REST_BACKFILL", closed=True)
+            price = float(frame["close"].iloc[-1])
+            tick = {"symbol": symbol, "price": price, "source": f"{CFG.binance_rest_base_url}:REST_KLINE", "data_quality": "LIVE", "ts": iso_now()}
+        state.set_json(f"latest_price:{symbol}", tick, ex=120)
+        state.set_json(f"market_feed_status:{symbol}", {**tick, "mode": "REST_POLL"}, ex=180)
+        state.publish("market_ticks", tick)
+        db_execute(engine, "INSERT INTO market_ticks(symbol, price, source, data_quality, ts) VALUES(:symbol, :price, :source, :data_quality, :ts)", {**tick, "ts": now_utc().replace(tzinfo=None)})
+        ob = fetch_orderbook(symbol)
+        cross_state = cross_exchange_state(symbol, price)
+        state.set_json(f"latest_cross_exchange:{symbol}", cross_state, ex=120)
+        state.set_json(f"latest_external_prices:{symbol}", cross_state, ex=120)
+        ob["cross_exchange_spread_bps"] = cross_state["cross_exchange_spread_bps"]
+        ob_payload = {"symbol": symbol, **ob, "ts": iso_now()}
+        state.set_json(f"latest_orderbook:{symbol}", ob_payload, ex=120)
+        state.set_json(f"latest_obi:{symbol}", ob_payload, ex=120)
+        state.publish("orderbook_updates", ob_payload)
+        db_execute(engine, "INSERT INTO orderbook_snapshots(symbol, bid_volume, ask_volume, obi, spread_bps, liquidity_score, data_quality, ts) VALUES(:symbol, :bid_volume, :ask_volume, :obi, :spread_bps, :liquidity_score, :data_quality, :ts)", {**ob_payload, "ts": now_utc().replace(tzinfo=None)})
+        funding = fetch_funding_state(symbol)
+        state.set_json(f"latest_funding:{symbol}", funding, ex=300)
+        db_execute(
+            engine,
+            "INSERT INTO funding_rates(symbol, funding_rate, percentile, data_quality, ts) VALUES(:symbol, :funding_rate, :percentile, :data_quality, :ts)",
+            {**funding, "ts": now_utc().replace(tzinfo=None)},
+        )
+        prior_oi = state.get_json(f"latest_open_interest:{symbol}")
+        oi = fetch_open_interest_state(symbol, None if not prior_oi else float(prior_oi.get("open_interest", 0.0)))
+        state.set_json(f"latest_open_interest:{symbol}", oi, ex=300)
+        db_execute(
+            engine,
+            "INSERT INTO open_interest_snapshots(symbol, open_interest, oi_change, data_quality, ts) VALUES(:symbol, :open_interest, :oi_change, :data_quality, :ts)",
+            {**oi, "ts": now_utc().replace(tzinfo=None)},
+        )
+
+
+def seed_marketdata_history(state: RedisState, engine: Engine) -> dict[str, pd.DataFrame]:
+    buffers: dict[str, pd.DataFrame] = {}
+    for symbol in CFG.symbols:
+        frame = fetch_binance_klines(symbol, "1m", limit=CFG.market_data_history_limit)
+        if frame is None or frame.empty:
+            frame = synthetic_ohlcv(symbol, bars=min(CFG.market_data_history_limit, 240))
+            source = "SIMULATED_SEED"
+        else:
+            source = f"{CFG.binance_rest_base_url}:REST_SEED"
+        buffers[symbol] = frame.tail(CFG.market_data_history_limit).reset_index(drop=True)
+        store_candle_frames(state, symbol, buffers[symbol], source=source, closed=True)
+        price = float(buffers[symbol]["close"].iloc[-1])
+        quality = "SIMULATED" if source == "SIMULATED_SEED" else "LIVE"
+        tick = {"symbol": symbol, "price": price, "source": source, "data_quality": quality, "ts": iso_now()}
+        state.set_json(f"latest_price:{symbol}", tick, ex=180)
+        state.set_json(f"market_feed_status:{symbol}", {**tick, "mode": "SEED"}, ex=300)
+        db_execute(engine, "INSERT INTO market_ticks(symbol, price, source, data_quality, ts) VALUES(:symbol, :price, :source, :data_quality, :ts)", {**tick, "ts": now_utc().replace(tzinfo=None)})
+    return buffers
+
+
+def update_one_minute_buffer(buffer: pd.DataFrame, candle: dict[str, Any]) -> pd.DataFrame:
+    row = pd.DataFrame([candle])
+    if buffer is None or buffer.empty:
+        frame = row
+    else:
+        frame = pd.concat([buffer, row], ignore_index=True)
+    frame["time"] = pd.to_datetime(frame["time"], utc=True).dt.tz_convert(None)
+    frame = frame.sort_values("time").drop_duplicates(subset=["time"], keep="last")
+    return frame.tail(CFG.market_data_history_limit).reset_index(drop=True)
+
+
+def run_marketdata_websocket(state: RedisState, engine: Engine) -> None:
+    buffers = seed_marketdata_history(state, engine)
+    streams = "/".join(f"{symbol.lower()}@kline_1m" for symbol in CFG.symbols)
+    url = f"{CFG.binance_ws_base_url}/stream?streams={streams}"
+    last_aux_refresh = 0.0
+    last_message_at = {"value": time.time()}
+
+    def refresh_auxiliary() -> None:
+        nonlocal last_aux_refresh
+        if time.time() - last_aux_refresh < 30:
+            return
+        last_aux_refresh = time.time()
         for symbol in CFG.symbols:
-            price, quality = fetch_binance_price(symbol)
-            tick = {"symbol": symbol, "price": price, "source": "BINANCE_PUBLIC", "data_quality": quality, "ts": iso_now()}
-            state.set_json(f"latest_price:{symbol}", tick, ex=120)
-            state.set_json(f"latest_kline:{symbol}:{CFG.interval}", tick, ex=120)
-            state.publish("market_ticks", tick)
-            db_execute(engine, "INSERT INTO market_ticks(symbol, price, source, data_quality, ts) VALUES(:symbol, :price, :source, :data_quality, :ts)", {**tick, "ts": now_utc().replace(tzinfo=None)})
+            latest = state.get_json(f"latest_price:{symbol}") or {"price": simulated_price(symbol)}
             ob = fetch_orderbook(symbol)
-            cross_state = cross_exchange_state(symbol, price)
+            cross_state = cross_exchange_state(symbol, float(latest.get("price", simulated_price(symbol))))
             state.set_json(f"latest_cross_exchange:{symbol}", cross_state, ex=120)
-            state.set_json(f"latest_external_prices:{symbol}", cross_state, ex=120)
             ob["cross_exchange_spread_bps"] = cross_state["cross_exchange_spread_bps"]
             ob_payload = {"symbol": symbol, **ob, "ts": iso_now()}
             state.set_json(f"latest_orderbook:{symbol}", ob_payload, ex=120)
@@ -1664,21 +1865,132 @@ def run_marketdata() -> None:
             db_execute(engine, "INSERT INTO orderbook_snapshots(symbol, bid_volume, ask_volume, obi, spread_bps, liquidity_score, data_quality, ts) VALUES(:symbol, :bid_volume, :ask_volume, :obi, :spread_bps, :liquidity_score, :data_quality, :ts)", {**ob_payload, "ts": now_utc().replace(tzinfo=None)})
             funding = fetch_funding_state(symbol)
             state.set_json(f"latest_funding:{symbol}", funding, ex=300)
-            db_execute(
-                engine,
-                "INSERT INTO funding_rates(symbol, funding_rate, percentile, data_quality, ts) VALUES(:symbol, :funding_rate, :percentile, :data_quality, :ts)",
-                {**funding, "ts": now_utc().replace(tzinfo=None)},
-            )
             prior_oi = state.get_json(f"latest_open_interest:{symbol}")
             oi = fetch_open_interest_state(symbol, None if not prior_oi else float(prior_oi.get("open_interest", 0.0)))
             state.set_json(f"latest_open_interest:{symbol}", oi, ex=300)
-            db_execute(
-                engine,
-                "INSERT INTO open_interest_snapshots(symbol, open_interest, oi_change, data_quality, ts) VALUES(:symbol, :open_interest, :oi_change, :data_quality, :ts)",
-                {**oi, "ts": now_utc().replace(tzinfo=None)},
-            )
-        heartbeat(engine, state, "worker-marketdata", detail={"symbols": CFG.symbols})
+
+    def on_message(_: Any, message: str) -> None:
+        last_message_at["value"] = time.time()
+        payload = json.loads(message)
+        data = payload.get("data", payload)
+        kline = data.get("k", {})
+        symbol = str(kline.get("s") or data.get("s") or "").upper()
+        if not symbol:
+            return
+        candle = {
+            "time": pd.to_datetime(int(kline["t"]), unit="ms", utc=True).tz_convert(None),
+            "open": float(kline["o"]),
+            "high": float(kline["h"]),
+            "low": float(kline["l"]),
+            "close": float(kline["c"]),
+            "volume": float(kline["v"]),
+            "quote_volume": float(kline.get("q", 0.0) or 0.0),
+            "taker_buy_quote": float(kline.get("Q", 0.0) or 0.0),
+        }
+        buffers[symbol] = update_one_minute_buffer(buffers.get(symbol, pd.DataFrame()), candle)
+        store_candle_frames(state, symbol, buffers[symbol], source=f"{CFG.binance_ws_base_url}:WS_KLINE_1M", closed=bool(kline.get("x")))
+        tick = {"symbol": symbol, "price": candle["close"], "source": f"{CFG.binance_ws_base_url}:WS_KLINE_1M", "data_quality": "LIVE", "ts": iso_now(), "closed": bool(kline.get("x"))}
+        state.set_json(f"latest_price:{symbol}", tick, ex=120)
+        state.set_json(f"market_feed_status:{symbol}", {**tick, "mode": "TESTNET_WS"}, ex=180)
+        state.publish("market_ticks", tick)
+        db_execute(engine, "INSERT INTO market_ticks(symbol, price, source, data_quality, ts) VALUES(:symbol, :price, :source, :data_quality, :ts)", {**tick, "ts": now_utc().replace(tzinfo=None)})
+        refresh_auxiliary()
+        heartbeat(engine, state, "worker-marketdata", detail={"mode": "TESTNET_WS", "symbols": CFG.symbols, "url": url})
+
+    def on_error(_: Any, error: Any) -> None:
+        heartbeat(engine, state, "worker-marketdata", status="DEGRADED", detail={"mode": "TESTNET_WS", "error": str(error)[:240]})
+
+    def on_close(_: Any, status_code: Any, message: Any) -> None:
+        heartbeat(engine, state, "worker-marketdata", status="DEGRADED", detail={"mode": "TESTNET_WS", "close_code": status_code, "message": str(message)[:240]})
+
+    def on_open(_: Any) -> None:
+        heartbeat(engine, state, "worker-marketdata", detail={"mode": "TESTNET_WS", "symbols": CFG.symbols, "url": url})
+
+    while True:
+        app = websocket.WebSocketApp(url, on_open=on_open, on_message=on_message, on_error=on_error, on_close=on_close)
+        sslopt = {} if CFG.binance_verify_tls else {"cert_reqs": ssl.CERT_NONE}
+        stop_watchdog = threading.Event()
+
+        def watchdog() -> None:
+            while not stop_watchdog.wait(5):
+                stale_for = time.time() - last_message_at["value"]
+                if stale_for > CFG.market_data_ws_stale_seconds:
+                    heartbeat(engine, state, "worker-marketdata", status="DEGRADED", detail={"mode": "TESTNET_WS", "reason": "websocket_stale", "stale_seconds": round(stale_for, 1), "reconnect_seconds": CFG.market_data_ws_reconnect_seconds})
+                    app.close()
+                    return
+
+        thread = threading.Thread(target=watchdog, name="marketdata-ws-watchdog", daemon=True)
+        thread.start()
+        with market_proxy_environment():
+            app.run_forever(ping_interval=20, ping_timeout=10, reconnect=0, sslopt=sslopt)
+        stop_watchdog.set()
+        run_marketdata_rest_poll(state, engine)
+        heartbeat(engine, state, "worker-marketdata", status="DEGRADED", detail={"mode": "REST_AFTER_WS_DISCONNECT", "retry_seconds": CFG.market_data_ws_reconnect_seconds})
+        last_message_at["value"] = time.time()
+        time.sleep(CFG.market_data_ws_reconnect_seconds)
+
+
+def run_marketdata() -> None:
+    state, engine = RedisState(CFG), db_engine(CFG)
+    init_schema(engine)
+    if CFG.market_data_source in {"TESTNET_WS", "WS", "WEBSOCKET"}:
+        run_marketdata_websocket(state, engine)
+        return
+    while True:
+        run_marketdata_rest_poll(state, engine)
+        heartbeat(engine, state, "worker-marketdata", detail={"mode": "REST_POLL", "symbols": CFG.symbols})
         time.sleep(5)
+
+
+def market_feed_check() -> int:
+    results: dict[str, Any] = {
+        "generated_at": iso_now(),
+        "market_data_source": CFG.market_data_source,
+        "rest_base": CFG.binance_rest_base_url,
+        "ws_base": CFG.binance_ws_base_url,
+        "trust_env_proxy": CFG.market_data_trust_env_proxy,
+        "verify_tls": CFG.binance_verify_tls,
+        "symbols": {},
+    }
+    ok = True
+    for symbol in CFG.symbols:
+        item: dict[str, Any] = {}
+        started = time.perf_counter()
+        try:
+            price = binance_get("/api/v3/ticker/price", {"symbol": symbol}, timeout=5)
+            item["rest_price"] = float(price["price"])
+            item["rest_ms"] = round((time.perf_counter() - started) * 1000, 1)
+            item["rest_ok"] = True
+        except Exception as exc:
+            item["rest_ok"] = False
+            item["rest_error"] = str(exc)[:240]
+            if CFG.market_data_source not in {"TESTNET_WS", "WS", "WEBSOCKET"}:
+                ok = False
+        stream_url = f"{CFG.binance_ws_base_url}/ws/{symbol.lower()}@kline_1m"
+        started = time.perf_counter()
+        try:
+            sslopt = {} if CFG.binance_verify_tls else {"cert_reqs": ssl.CERT_NONE}
+            with market_proxy_environment():
+                ws = websocket.create_connection(stream_url, timeout=8, sslopt=sslopt)
+                message = json.loads(ws.recv())
+                ws.close()
+            kline = message.get("k", {})
+            item["ws_ok"] = bool(kline)
+            item["ws_price"] = float(kline.get("c", 0.0) or 0.0)
+            item["ws_closed_candle"] = bool(kline.get("x"))
+            item["ws_ms"] = round((time.perf_counter() - started) * 1000, 1)
+            item["ws_url"] = stream_url
+            if not item["ws_ok"]:
+                ok = False
+        except Exception as exc:
+            item["ws_ok"] = False
+            item["ws_error"] = str(exc)[:240]
+            item["ws_url"] = stream_url
+            if CFG.market_data_source in {"TESTNET_WS", "WS", "WEBSOCKET"}:
+                ok = False
+        results["symbols"][symbol] = item
+    print(json.dumps(results, indent=2, default=str))
+    return 0 if ok else 1
 
 
 def run_signal() -> None:
@@ -1693,8 +2005,13 @@ def run_signal() -> None:
             ob = state.get_json(f"latest_orderbook:{symbol}") or fetch_orderbook(symbol)
             cross_state = state.get_json(f"latest_cross_exchange:{symbol}") or cross_exchange_state(symbol, float(price_payload["price"]))
             ob["cross_exchange_spread_bps"] = cross_state["cross_exchange_spread_bps"]
-            market_frame = fetch_binance_klines(symbol, CFG.strategy_interval, limit=180)
-            signal = alpha_signal(symbol, float(price_payload["price"]), ob, CFG, market_frame=market_frame)
+            market_frame = latest_candle_frame(state, symbol, CFG.strategy_interval, limit=180)
+            if market_frame is None:
+                market_frame = fetch_binance_klines(symbol, CFG.strategy_interval, limit=180)
+            htf_frame = latest_candle_frame(state, symbol, CFG.higher_timeframe_interval, limit=120)
+            signal = alpha_signal(symbol, float(price_payload["price"]), ob, CFG, market_frame=market_frame, htf_frame=htf_frame)
+            signal["market_source"] = str(price_payload.get("source", signal.get("market_source", "")))
+            signal["market_data_quality"] = str(price_payload.get("data_quality", signal.get("market_data_quality", "")))
             funding = state.get_json(f"latest_funding:{symbol}") or {"funding_rate": 0.0, "percentile": 0.5}
             oi = state.get_json(f"latest_open_interest:{symbol}") or {"oi_change": 0.0}
             signal["funding_pressure"] = float(np.clip(float(funding.get("funding_rate", 0.0)) * 6000, -1, 1))
@@ -2194,8 +2511,12 @@ def run_ml() -> None:
             heartbeat(engine, state, "worker-ml", status="ONLINE", detail={"phase": "training"})
             pieces = []
             for symbol in CFG.symbols:
-                frame = fetch_binance_klines(symbol, CFG.strategy_interval, limit=CFG.ml_training_bars)
-                htf_frame = fetch_binance_klines(symbol, CFG.higher_timeframe_interval, limit=max(120, CFG.ml_training_bars // 16))
+                frame = latest_candle_frame(state, symbol, CFG.strategy_interval, limit=CFG.ml_training_bars)
+                if frame is None:
+                    frame = fetch_binance_klines(symbol, CFG.strategy_interval, limit=CFG.ml_training_bars)
+                htf_frame = latest_candle_frame(state, symbol, CFG.higher_timeframe_interval, limit=max(120, CFG.ml_training_bars // 16))
+                if htf_frame is None:
+                    htf_frame = fetch_binance_klines(symbol, CFG.higher_timeframe_interval, limit=max(120, CFG.ml_training_bars // 16))
                 if frame is None:
                     frame = synthetic_ohlcv(symbol, bars=CFG.ml_training_bars)
                 candidates = training_candidates(symbol, frame, htf_frame)
@@ -2296,7 +2617,11 @@ def demo_rows(state: RedisState) -> list[dict[str, Any]]:
         if cross_state:
             ob["cross_exchange_spread_bps"] = cross_state["cross_exchange_spread_bps"]
         sig = state.get_json(f"latest_signal:{symbol}") if state.ok else None
-        sig = sig or alpha_signal(symbol, float(price["price"]), ob, CFG, allow_live_fetch=state.ok)
+        if not sig:
+            market_frame = latest_candle_frame(state, symbol, CFG.strategy_interval, limit=180) if state.ok else None
+            sig = alpha_signal(symbol, float(price["price"]), ob, CFG, market_frame=market_frame, allow_live_fetch=state.ok)
+            sig["market_source"] = str(price.get("source", sig.get("market_source", "")))
+            sig["market_data_quality"] = str(price.get("data_quality", sig.get("market_data_quality", "")))
         rows.append(sig)
     return rows
 
@@ -3373,11 +3698,14 @@ def scanner_radar_html(rows: list[dict[str, Any]]) -> str:
         symbol = html_lib.escape(str(row.get("symbol", "")))
         side = html_lib.escape(str(row.get("candidate_side", row.get("side", "HOLD"))))
         reason = html_lib.escape(scanner_reason(row))
+        feed = html_lib.escape(str(row.get("market_data_quality", "UNKNOWN")))
+        source = html_lib.escape(str(row.get("market_source", "")).replace("wss://", "").replace("https://", "")[:42])
         cards.append(
             f"<div class='scan-tile'>"
             f"<div class='scan-top'><b>{symbol}</b><span style='color:{color};border-color:{color}66;background:{color}1f'>{status}</span></div>"
             f"<div class='scan-price'>${float(row.get('price', 0) or 0):,.4f}</div>"
             f"<div class='scan-meta'><span>Bias: {side}</span><span>ML {float(row.get('ml_confidence', 0) or 0):.2f}</span></div>"
+            f"<div class='scan-meta'><span>Feed: {feed}</span><span>{source}</span></div>"
             f"<div class='scan-bar'><div style='width:{progress}%;background:{color}'></div></div>"
             f"<div class='scan-meta'><span>{progress}% scanned</span><span>Next: {html_lib.escape(next_phase)}</span></div>"
             f"<div class='scan-reason'>{reason}</div>"
@@ -3588,7 +3916,7 @@ def render_ui() -> None:
         return
 
     df = pd.DataFrame(rows)
-    scanner_cols = ["symbol", "candidate_side", "side", "price", "strategy_interval", "z_score", "rsi", "volume_z", "adx", "expected_reversion_bps", "ml_confidence", "ml_model_version", "obi", "cross_exchange_spread_bps", "model_slippage_bps", "funding_pressure", "open_interest_signal", "win_p_est", "payoff_b", "kelly_fraction", "suggested_usdt", "research_only", "deployable", "deployment_blockers", "rationale"]
+    scanner_cols = ["symbol", "candidate_side", "side", "price", "market_data_quality", "market_source", "strategy_interval", "z_score", "rsi", "volume_z", "adx", "expected_reversion_bps", "ml_confidence", "ml_model_version", "obi", "cross_exchange_spread_bps", "model_slippage_bps", "funding_pressure", "open_interest_signal", "win_p_est", "payoff_b", "kelly_fraction", "suggested_usdt", "research_only", "deployable", "deployment_blockers", "rationale"]
     alerts = overview_alerts(rows, validation, report, risk, drift)
 
     header_left, header_right = st.columns([2.4, 1])
@@ -3918,7 +4246,7 @@ def render_ui() -> None:
 
 
 def main() -> None:
-    cli_modes = {"ui", "marketdata", "validation", "validation-once", "signal", "risk", "order", "ml", "pnl", "report", "migrate-db"}
+    cli_modes = {"ui", "marketdata", "market-check", "validation", "validation-once", "signal", "risk", "order", "ml", "pnl", "report", "migrate-db"}
     mode = sys.argv[1].strip().lower() if len(sys.argv) > 1 and sys.argv[1].strip().lower() in cli_modes else CFG.run_mode
     if mode == "ui":
         if "streamlit" not in sys.modules:
@@ -3926,6 +4254,8 @@ def main() -> None:
         render_ui()
     elif mode == "marketdata":
         run_marketdata()
+    elif mode == "market-check":
+        raise SystemExit(market_feed_check())
     elif mode == "validation":
         run_validation()
     elif mode == "validation-once":

@@ -90,15 +90,18 @@ def scenario_validation_worker_headless(app: Any) -> dict[str, Any]:
     capture = CaptureDb()
     original_db_execute = app.db_execute
     original_fetch = app.fetch_binance_klines
+    original_redis_state = app.RedisState
     try:
         app.db_execute = capture.execute
         app.fetch_binance_klines = lambda symbol, interval, limit=120: app.synthetic_ohlcv(symbol, bars=limit)
+        app.RedisState = lambda cfg: FakeState()
         started = time.perf_counter()
         statuses = app.run_validation_cycle(state, object(), use_locks=False)
         elapsed = time.perf_counter() - started
     finally:
         app.db_execute = original_db_execute
         app.fetch_binance_klines = original_fetch
+        app.RedisState = original_redis_state
 
     latest = state.get_json("latest_validation:BTCUSDT")
     assert_true(statuses.get("BTCUSDT") in {"GREEN", "AMBER", "RED"}, "validation worker did not return a valid status")
@@ -150,15 +153,38 @@ def scenario_order_gate_requires_validation(app: Any) -> dict[str, Any]:
     return {"amber_allowed": blocked, "amber_reason": blocked_reason, "green_allowed": allowed}
 
 
+def scenario_websocket_candle_cache_feeds_signals(app: Any) -> dict[str, Any]:
+    state = FakeState()
+    frame = app.synthetic_ohlcv("BTCUSDT", bars=1500)
+    app.store_candle_frames(state, "BTCUSDT", frame, source="TESTNET_WS_TEST", closed=True)
+    one_min = app.latest_candle_frame(state, "BTCUSDT", "1m", limit=120)
+    five_min = app.latest_candle_frame(state, "BTCUSDT", "5m", limit=120)
+    fifteen_min = app.latest_candle_frame(state, "BTCUSDT", "15m", limit=120)
+    assert_true(one_min is not None and len(one_min) >= 100, "1m candle cache missing")
+    assert_true(five_min is not None and len(five_min) >= 80, "5m candle aggregation missing")
+    assert_true(fifteen_min is not None and len(fifteen_min) >= 80, "15m candle aggregation missing")
+    price = float(fifteen_min["close"].iloc[-1])
+    orderbook = app.simulated_orderbook()
+    signal = app.alpha_signal("BTCUSDT", price, orderbook, app.CFG, market_frame=fifteen_min, allow_live_fetch=False)
+    assert_true(signal["market_source"] == "CANDLE_BUFFER", "signal did not use cached candle frame")
+    assert_true(abs(float(signal["price"]) - price) < 1e-9, "signal price did not come from cached latest price")
+    return {"one_min_rows": len(one_min), "five_min_rows": len(five_min), "fifteen_min_rows": len(fifteen_min), "signal_source": signal["market_source"]}
+
+
 def scenario_ui_independence_contract() -> dict[str, Any]:
     prod_compose = (ROOT / "docker-compose.prod.yml").read_text(encoding="utf-8")
     app_source = (ROOT / "horizon_institutional_live_production_grade.py").read_text(encoding="utf-8")
+    env_template = (ROOT / ".env.production.example").read_text(encoding="utf-8")
+    control_script = (ROOT / "scripts" / "horizonctl.sh").read_text(encoding="utf-8")
     assert_true("worker-validation:" in prod_compose, "production compose missing worker-validation")
     assert_true('profiles: ["ui"]' in prod_compose, "UI service must stay optional behind a compose profile")
     assert_true("RUN_MODE: validation" in prod_compose, "validation worker RUN_MODE missing")
     assert_true("latest_validation_snapshot(state, engine, selected" in app_source, "UI should read validation state rather than own persistence")
     assert_true("persist_validation_snapshot(engine, validation)" not in app_source, "UI still appears to persist validation snapshots")
-    return {"compose_validation_worker": True, "ui_profile_optional": True, "ui_reads_validation": True}
+    assert_true("MARKET_DATA_SOURCE=TESTNET_WS" in env_template, "Testnet websocket should be the default market data source")
+    assert_true("market-check" in control_script, "market-check CLI command missing")
+    assert_true("latest_klines:{symbol}:{interval}" in app_source, "candle buffers are not persisted by interval")
+    return {"compose_validation_worker": True, "ui_profile_optional": True, "ui_reads_validation": True, "testnet_ws_default": True}
 
 
 def scenario_performance_budget(app: Any, runs: int = 3) -> dict[str, Any]:
@@ -166,9 +192,11 @@ def scenario_performance_budget(app: Any, runs: int = 3) -> dict[str, Any]:
     capture = CaptureDb()
     original_db_execute = app.db_execute
     original_fetch = app.fetch_binance_klines
+    original_redis_state = app.RedisState
     try:
         app.db_execute = capture.execute
         app.fetch_binance_klines = lambda symbol, interval, limit=120: app.synthetic_ohlcv(symbol, bars=limit)
+        app.RedisState = lambda cfg: FakeState()
         for _ in range(runs):
             started = time.perf_counter()
             app.run_validation_cycle(FakeState(), object(), use_locks=False)
@@ -176,6 +204,7 @@ def scenario_performance_budget(app: Any, runs: int = 3) -> dict[str, Any]:
     finally:
         app.db_execute = original_db_execute
         app.fetch_binance_klines = original_fetch
+        app.RedisState = original_redis_state
     p95 = max(timings)
     assert_true(p95 < 10.0, f"validation cycle too slow for one symbol offline: {p95:.3f}s")
     return {"runs": runs, "avg_seconds": statistics.mean(timings), "p95_seconds": p95}
@@ -186,6 +215,7 @@ def main() -> int:
     scenarios = [
         ("validation_worker_headless", lambda: scenario_validation_worker_headless(app)),
         ("order_gate_requires_validation", lambda: scenario_order_gate_requires_validation(app)),
+        ("websocket_candle_cache_feeds_signals", lambda: scenario_websocket_candle_cache_feeds_signals(app)),
         ("ui_independence_contract", scenario_ui_independence_contract),
         ("validation_performance_budget", lambda: scenario_performance_budget(app)),
     ]

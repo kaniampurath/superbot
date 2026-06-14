@@ -1,5 +1,5 @@
 param(
-    [ValidateSet("start-backend", "start-ui", "local-ui", "health", "status", "performance", "performance-json", "validate-once", "test-headless", "migrate-db", "stop")]
+    [ValidateSet("start-backend", "start-ui", "local-ui", "health", "status", "performance", "performance-json", "validate-once", "market-check", "test-headless", "migrate-db", "stop")]
     [string]$Action = "health"
 )
 
@@ -141,6 +141,14 @@ switch ($Action) {
             docker compose run --rm --no-deps worker-validation python horizon_institutional_live_production_grade.py validation-once
         } else {
             $env:RUN_MODE = "validation-once"
+            python horizon_institutional_live_production_grade.py
+        }
+    }
+    "market-check" {
+        if (Invoke-NativeOk { docker info }) {
+            docker compose run --rm --no-deps worker-marketdata python horizon_institutional_live_production_grade.py market-check
+        } else {
+            $env:RUN_MODE = "market-check"
             python horizon_institutional_live_production_grade.py
         }
     }

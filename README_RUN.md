@@ -156,6 +156,7 @@ Actions:
 | `performance` | Prints equity, P&L, drawdown, risk, drift, worker status, orders, model metrics, and latest signals from backend state |
 | `performance-json` | Prints the same report as JSON for scripts and monitoring |
 | `validate-once` | Runs one headless validation/backtest cycle and prints symbol statuses |
+| `market-check` | Tests configured Binance Testnet REST and websocket market-data endpoints |
 | `test-headless` | Runs functional and performance scenarios proving backend handoffs work without the UI |
 | `status` | Shows Docker service state and UI health |
 | `stop` | Stops backend and UI containers |
@@ -167,6 +168,7 @@ bash scripts/horizonctl.sh health
 bash scripts/horizonctl.sh status
 bash scripts/horizonctl.sh performance
 bash scripts/horizonctl.sh performance-json
+bash scripts/horizonctl.sh market-check
 bash scripts/horizonctl.sh validate-once
 bash scripts/horizonctl.sh test-headless
 ```
@@ -205,6 +207,19 @@ Storage is controlled by `VALIDATION_WORKER_SECONDS`, `VALIDATION_BACKTEST_BARS`
 ```bash
 bash scripts/horizonctl.sh validate-once
 ```
+
+## Market Data Feed
+`worker-marketdata` uses Binance Spot Testnet websocket candles by default: `MARKET_DATA_SOURCE=TESTNET_WS`, `BINANCE_WS_BASE_URL=wss://stream.testnet.binance.vision:9443`, and `BINANCE_REST_BASE_URL=https://testnet.binance.vision`. On startup it uses REST klines only to seed historical context, then streams 1-minute klines and builds `1m`, `5m`, and `15m` candle buffers in Redis as `latest_klines:{symbol}:{interval}`. Signals, validation, and ML read those buffers before falling back to REST or simulation.
+
+The websocket loop uses ping/pong plus a stale-message watchdog. If no kline update arrives within `MARKET_DATA_WS_STALE_SECONDS`, the worker closes the socket, runs one REST backfill/poll cycle, waits `MARKET_DATA_WS_RECONNECT_SECONDS`, and reconnects.
+
+Use this to verify the feed from the prompt:
+
+```bash
+bash scripts/horizonctl.sh market-check
+```
+
+Scanner cards show feed quality/source so simulated fallback cannot look like live market data.
 
 ## Mean-Reversion Strategy Defaults
 The deployable strategy is short-term mean reversion on `STRATEGY_INTERVAL=15m`. Default gates are `abs(z) >= 2.7`, BUY only when `RSI <= 35`, SELL only when `RSI >= 65`, `volume_z >= -0.5`, taker-flow confirmation, low-trend regime with `ADX <= 22`, falling realized volatility, expected mean-reversion move at least `3x` round-trip cost, and order-book confirmation. A 4h trend guard blocks shorts in strong higher-timeframe uptrends and buys in strong higher-timeframe downtrends. Deployment requires green full and rolling validation: profit factor >= `1.2`, expectancy >= `5` bps, and max validation drawdown <= `8%`.

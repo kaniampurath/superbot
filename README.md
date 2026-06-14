@@ -28,6 +28,7 @@ sudo systemctl start horizon-backend
 sudo systemctl start horizon-ui
 bash scripts/healthcheck_ubuntu.sh
 bash scripts/horizonctl.sh migrate-db
+bash scripts/horizonctl.sh market-check
 bash scripts/horizonctl.sh validate-once
 bash scripts/horizonctl.sh test-headless
 bash scripts/horizonctl.sh performance
@@ -61,6 +62,7 @@ From Ubuntu CLI:
 ```bash
 bash scripts/horizonctl.sh performance
 bash scripts/horizonctl.sh performance-json
+bash scripts/horizonctl.sh market-check
 bash scripts/horizonctl.sh validate-once
 bash scripts/horizonctl.sh test-headless
 ```
@@ -97,6 +99,8 @@ bash scripts/horizonctl.sh redis
 ```
 
 `migrate-db` runs the app's idempotent schema bootstrap and migration list against MariaDB. Use it after pulling a release that adds or changes tables.
+
+`market-check` tests the configured Binance Testnet REST and websocket endpoints from the same runtime environment as the market-data worker.
 
 `test-headless` runs backend-only functional and performance checks. It proves validation/backtest can run without the UI, compact DB records and handoff events are produced, and training auto-approval is blocked unless validation is green.
 

@@ -74,6 +74,13 @@ case "$ACTION" in
       RUN_MODE=validation-once python horizon_institutional_live_production_grade.py
     fi
     ;;
+  market-check)
+    if docker_ready; then
+      compose run --rm --no-deps worker-marketdata python horizon_institutional_live_production_grade.py market-check
+    else
+      RUN_MODE=market-check python horizon_institutional_live_production_grade.py
+    fi
+    ;;
   test-headless)
     if docker_ready; then
       compose run --rm --no-deps worker-validation python scripts/headless_functional_test.py
@@ -94,7 +101,7 @@ case "$ACTION" in
     compose --profile ui down
     ;;
   *)
-    echo "Usage: scripts/horizonctl.sh {start-backend|start-ui|health|status|logs|db|redis|troubleshoot|performance|performance-json|validate-once|test-headless|migrate-db|stop}"
+    echo "Usage: scripts/horizonctl.sh {start-backend|start-ui|health|status|logs|db|redis|troubleshoot|performance|performance-json|validate-once|market-check|test-headless|migrate-db|stop}"
     exit 2
     ;;
 esac
