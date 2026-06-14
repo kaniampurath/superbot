@@ -78,6 +78,8 @@ Open the UI only when the `ui` profile is enabled:
 http://localhost:8501
 ```
 
+If Docker Desktop storage was moved, for example to `D:\dockerimage`, no compose file change is required. Images and named volumes are managed by Docker Desktop. If the storage move was not migrated, old MariaDB/Redis named-volume data may not appear until the Docker data-root migration is fixed.
+
 ## Ubuntu / DigitalOcean Release
 Use the production compose file and installer on an Ubuntu droplet:
 
@@ -124,6 +126,8 @@ PowerShell:
 
 ```powershell
 .\horizonctl.ps1 health
+.\horizonctl.ps1 start-redis
+.\horizonctl.ps1 start-local-cache
 .\horizonctl.ps1 start-backend
 .\horizonctl.ps1 start-ui
 .\horizonctl.ps1 performance
@@ -150,9 +154,11 @@ Actions:
 | Action | Purpose |
 |---|---|
 | `health` | Compile check, Docker Compose validation, backend/UI profile check, credential presence check, current service status, and UI health probe |
-| `start-backend` | Starts the headless backend only: MariaDB, Redis, market data, validation, signal, risk, ML, order, and P&L workers |
-| `start-ui` | Starts backend plus optional Streamlit UI using the `ui` profile |
-| `local-ui` | Runs only the local Streamlit UI process from the prompt |
+| `start-redis` | Starts a local Redis container named `superbot-local-redis` on port `6379`, reusing it when it already exists |
+| `start-local-cache` | Starts local Redis and a hidden Testnet websocket market-data worker after Redis and MariaDB connectivity checks pass |
+| `start-backend` | Starts MariaDB and Redis first, verifies both are connectable, then starts the headless backend workers |
+| `start-ui` | Starts MariaDB and Redis first, verifies both are connectable, then starts backend workers plus optional Streamlit UI |
+| `local-ui` | Runs the local Streamlit UI only after local Redis and MariaDB connectivity checks pass |
 | `performance` | Prints equity, P&L, drawdown, risk, drift, worker status, orders, model metrics, and latest signals from backend state |
 | `performance-json` | Prints the same report as JSON for scripts and monitoring |
 | `validate-once` | Runs one headless validation/backtest cycle and prints symbol statuses |

@@ -17,13 +17,58 @@ docker_ready() {
   command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1
 }
 
+redis_ready() {
+  compose exec -T redis redis-cli ping >/dev/null 2>&1
+}
+
+mariadb_ready() {
+  compose exec -T mariadb healthcheck.sh --connect --innodb_initialized >/dev/null 2>&1
+}
+
+data_layer_ready() {
+  if ! docker_ready; then
+    echo "docker daemon                    FAIL unavailable"
+    return 1
+  fi
+  echo "Starting data layer first: redis + mariadb"
+  compose up -d mariadb redis
+  local redis_ok=1
+  local mariadb_ok=1
+  for _ in $(seq 1 30); do
+    redis_ready && redis_ok=0 || redis_ok=1
+    mariadb_ready && mariadb_ok=0 || mariadb_ok=1
+    if [ "$redis_ok" -eq 0 ] && [ "$mariadb_ok" -eq 0 ]; then
+      break
+    fi
+    sleep 2
+  done
+  if [ "$redis_ok" -eq 0 ]; then
+    echo "redis connection                 OK    container=redis"
+  else
+    echo "redis connection                 FAIL  redis-cli ping failed"
+  fi
+  if [ "$mariadb_ok" -eq 0 ]; then
+    echo "mariadb connection               OK    container=mariadb"
+  else
+    echo "mariadb connection               FAIL  MariaDB healthcheck failed"
+  fi
+  if [ "$redis_ok" -ne 0 ] || [ "$mariadb_ok" -ne 0 ]; then
+    echo "Data layer is not ready; backend/UI startup skipped."
+    compose ps || true
+    return 1
+  fi
+  return 0
+}
+
 case "$ACTION" in
   start-backend)
-    compose up -d --build
+    data_layer_ready
+    compose up -d --build worker-marketdata worker-validation worker-signal worker-risk worker-ml worker-order worker-pnl
     compose ps
     ;;
   start-ui)
-    compose --profile ui up -d --build
+    data_layer_ready
+    compose --profile ui up -d --build worker-marketdata worker-validation worker-signal worker-risk worker-ml worker-order worker-pnl horizon-ui
     compose --profile ui ps
     ;;
   health)
@@ -32,6 +77,8 @@ case "$ACTION" in
   status)
     if docker_ready; then
       compose ps
+      redis_ready && echo "redis connection: ok" || echo "redis connection: unavailable"
+      mariadb_ready && echo "mariadb connection: ok" || echo "mariadb connection: unavailable"
     else
       echo "Docker daemon: unavailable"
     fi

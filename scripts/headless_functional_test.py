@@ -171,6 +171,27 @@ def scenario_websocket_candle_cache_feeds_signals(app: Any) -> dict[str, Any]:
     return {"one_min_rows": len(one_min), "five_min_rows": len(five_min), "fifteen_min_rows": len(fifteen_min), "signal_source": signal["market_source"]}
 
 
+def scenario_ui_prefers_fresh_websocket_price(app: Any) -> dict[str, Any]:
+    state = FakeState()
+    app.store_candle_frames(state, "BTCUSDT", app.synthetic_ohlcv("BTCUSDT", bars=1500), source="TESTNET_WS_TEST", closed=True)
+    state.set_json(
+        "latest_price:BTCUSDT",
+        {"symbol": "BTCUSDT", "price": 64000.25, "source": "TESTNET_WS_TEST", "data_quality": "LIVE", "ts": app.iso_now()},
+    )
+    state.set_json(
+        "latest_signal:BTCUSDT",
+        {"symbol": "BTCUSDT", "side": "HOLD", "candidate_side": "HOLD", "price": 105000.0, "market_source": "STALE_SIGNAL", "market_data_quality": "SIMULATED", "ts": "2020-01-01T00:00:00+00:00"},
+    )
+    rows = app.demo_rows(state)
+    row = next(item for item in rows if item["symbol"] == "BTCUSDT")
+    assert_true(abs(float(row["price"]) - 64000.25) < 1e-9, "UI scanner did not prefer fresh websocket cache price")
+    assert_true(row["market_source"] == "TESTNET_WS_TEST", "UI scanner did not preserve websocket market source")
+    assert_true(row["market_data_quality"] == "LIVE", "UI scanner did not preserve live data quality")
+    assert_true(bool(row["market_cache_live"]), "UI scanner did not mark the websocket cache as live")
+    assert_true(float(row["market_cache_age_seconds"]) < 10, "UI scanner cache age should be fresh")
+    return {"ui_price": row["price"], "source": row["market_source"], "cache_age_seconds": row["market_cache_age_seconds"]}
+
+
 def scenario_ui_independence_contract() -> dict[str, Any]:
     prod_compose = (ROOT / "docker-compose.prod.yml").read_text(encoding="utf-8")
     app_source = (ROOT / "horizon_institutional_live_production_grade.py").read_text(encoding="utf-8")
@@ -216,6 +237,7 @@ def main() -> int:
         ("validation_worker_headless", lambda: scenario_validation_worker_headless(app)),
         ("order_gate_requires_validation", lambda: scenario_order_gate_requires_validation(app)),
         ("websocket_candle_cache_feeds_signals", lambda: scenario_websocket_candle_cache_feeds_signals(app)),
+        ("ui_prefers_fresh_websocket_price", lambda: scenario_ui_prefers_fresh_websocket_price(app)),
         ("ui_independence_contract", scenario_ui_independence_contract),
         ("validation_performance_budget", lambda: scenario_performance_budget(app)),
     ]

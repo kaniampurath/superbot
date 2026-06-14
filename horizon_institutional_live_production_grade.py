@@ -70,6 +70,24 @@ def iso_now() -> str:
     return now_utc().isoformat()
 
 
+def age_seconds(value: Any, default: float = 999999.0) -> float:
+    try:
+        timestamp = pd.Timestamp(value)
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.tz_localize("UTC")
+        else:
+            timestamp = timestamp.tz_convert("UTC")
+        return max(0.0, (pd.Timestamp.now(tz=UTC) - timestamp).total_seconds())
+    except Exception:
+        return default
+
+
+def fresh_payload(payload: dict[str, Any] | None, max_age_seconds: int = 180) -> bool:
+    if not payload:
+        return False
+    return age_seconds(payload.get("ts")) <= max_age_seconds
+
+
 def utc_naive_timestamp(value: Any) -> pd.Timestamp:
     timestamp = pd.Timestamp(value)
     if timestamp.tzinfo is not None:
@@ -2606,22 +2624,39 @@ def color_badge(label: str, status: str, tip: str) -> str:
 def demo_rows(state: RedisState) -> list[dict[str, Any]]:
     rows = []
     for symbol in CFG.symbols:
+        price_cache_ok = False
         if state.ok:
-            price = state.get_json(f"latest_price:{symbol}") or {"price": simulated_price(symbol), "data_quality": "SIMULATED", "ts": iso_now()}
+            price = state.get_json(f"latest_price:{symbol}") or {"price": simulated_price(symbol), "data_quality": "SIMULATED", "source": "CACHE_MISS", "ts": iso_now()}
+            price_cache_ok = fresh_payload(price, max(CFG.market_data_ws_stale_seconds, 180))
             ob = state.get_json(f"latest_orderbook:{symbol}") or simulated_orderbook()
             cross_state = state.get_json(f"latest_cross_exchange:{symbol}")
         else:
-            price = {"price": simulated_price(symbol), "data_quality": "SIMULATED", "ts": iso_now()}
+            price = {"price": simulated_price(symbol), "data_quality": "SIMULATED", "source": "NO_REDIS_CACHE", "ts": iso_now()}
             ob = simulated_orderbook()
             cross_state = None
         if cross_state:
             ob["cross_exchange_spread_bps"] = cross_state["cross_exchange_spread_bps"]
         sig = state.get_json(f"latest_signal:{symbol}") if state.ok else None
-        if not sig:
+        signal_is_stale = not fresh_payload(sig, max(CFG.market_data_ws_stale_seconds, 180)) if sig else True
+        if not sig or (price_cache_ok and signal_is_stale):
             market_frame = latest_candle_frame(state, symbol, CFG.strategy_interval, limit=180) if state.ok else None
-            sig = alpha_signal(symbol, float(price["price"]), ob, CFG, market_frame=market_frame, allow_live_fetch=state.ok)
+            sig = alpha_signal(symbol, float(price["price"]), ob, CFG, market_frame=market_frame, allow_live_fetch=False)
             sig["market_source"] = str(price.get("source", sig.get("market_source", "")))
             sig["market_data_quality"] = str(price.get("data_quality", sig.get("market_data_quality", "")))
+        elif price_cache_ok:
+            sig = dict(sig)
+            sig["price"] = float(price["price"])
+            sig["market_source"] = str(price.get("source", sig.get("market_source", "")))
+            sig["market_data_quality"] = str(price.get("data_quality", sig.get("market_data_quality", "")))
+            sig["ts"] = str(price.get("ts", sig.get("ts", iso_now())))
+        else:
+            sig = dict(sig)
+            sig["market_data_quality"] = "STALE_OR_SIMULATED"
+            sig["market_source"] = str(price.get("source", sig.get("market_source", "CACHE_STALE")))
+            sig["price"] = float(price.get("price", sig.get("price", simulated_price(symbol))))
+        sig["market_price_ts"] = str(price.get("ts", ""))
+        sig["market_cache_age_seconds"] = round(age_seconds(price.get("ts")), 1)
+        sig["market_cache_live"] = bool(price_cache_ok and str(price.get("data_quality", "")).upper() == "LIVE")
         rows.append(sig)
     return rows
 
@@ -3700,12 +3735,16 @@ def scanner_radar_html(rows: list[dict[str, Any]]) -> str:
         reason = html_lib.escape(scanner_reason(row))
         feed = html_lib.escape(str(row.get("market_data_quality", "UNKNOWN")))
         source = html_lib.escape(str(row.get("market_source", "")).replace("wss://", "").replace("https://", "")[:42])
+        cache_age = float(row.get("market_cache_age_seconds", 999999.0) or 999999.0)
+        age_label = "no cache" if cache_age > 9999 else f"{cache_age:.0f}s old"
+        price_text = f"${float(row.get('price', 0) or 0):,.4f}" if row.get("market_cache_live") else "Awaiting cache"
         cards.append(
             f"<div class='scan-tile'>"
             f"<div class='scan-top'><b>{symbol}</b><span style='color:{color};border-color:{color}66;background:{color}1f'>{status}</span></div>"
-            f"<div class='scan-price'>${float(row.get('price', 0) or 0):,.4f}</div>"
+            f"<div class='scan-price'>{html_lib.escape(price_text)}</div>"
             f"<div class='scan-meta'><span>Bias: {side}</span><span>ML {float(row.get('ml_confidence', 0) or 0):.2f}</span></div>"
-            f"<div class='scan-meta'><span>Feed: {feed}</span><span>{source}</span></div>"
+            f"<div class='scan-meta'><span>Feed: {feed}</span><span>{html_lib.escape(age_label)}</span></div>"
+            f"<div class='scan-source'>{source}</div>"
             f"<div class='scan-bar'><div style='width:{progress}%;background:{color}'></div></div>"
             f"<div class='scan-meta'><span>{progress}% scanned</span><span>Next: {html_lib.escape(next_phase)}</span></div>"
             f"<div class='scan-reason'>{reason}</div>"
@@ -3881,6 +3920,7 @@ def render_ui() -> None:
         .scan-top span{border:1px solid;border-radius:6px;padding:2px 7px;font-size:.72rem;font-weight:800}
         .scan-price{font-size:1.35rem;font-weight:800;color:#f8fafc;margin-top:8px}
         .scan-meta{display:flex;justify-content:space-between;gap:8px;color:#b6c6dc;font-size:.76rem;margin-top:6px}
+        .scan-source{color:#64748b;font-size:.68rem;margin-top:2px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis}
         .scan-bar{height:7px;background:#111827;border-radius:999px;margin-top:10px;overflow:hidden;border:1px solid #263750}
         .scan-bar div{height:100%;border-radius:999px}
         .scan-reason{color:#94a3b8;font-size:.75rem;line-height:1.25;margin-top:9px;min-height:34px}
@@ -3916,7 +3956,7 @@ def render_ui() -> None:
         return
 
     df = pd.DataFrame(rows)
-    scanner_cols = ["symbol", "candidate_side", "side", "price", "market_data_quality", "market_source", "strategy_interval", "z_score", "rsi", "volume_z", "adx", "expected_reversion_bps", "ml_confidence", "ml_model_version", "obi", "cross_exchange_spread_bps", "model_slippage_bps", "funding_pressure", "open_interest_signal", "win_p_est", "payoff_b", "kelly_fraction", "suggested_usdt", "research_only", "deployable", "deployment_blockers", "rationale"]
+    scanner_cols = ["symbol", "candidate_side", "side", "price", "market_data_quality", "market_source", "market_cache_age_seconds", "strategy_interval", "z_score", "rsi", "volume_z", "adx", "expected_reversion_bps", "ml_confidence", "ml_model_version", "obi", "cross_exchange_spread_bps", "model_slippage_bps", "funding_pressure", "open_interest_signal", "win_p_est", "payoff_b", "kelly_fraction", "suggested_usdt", "research_only", "deployable", "deployment_blockers", "rationale"]
     alerts = overview_alerts(rows, validation, report, risk, drift)
 
     header_left, header_right = st.columns([2.4, 1])
@@ -3961,8 +4001,11 @@ def render_ui() -> None:
 
         left, mid, right = st.columns([1.05, 1.35, .72])
         with left:
+            live_feed_count = sum(1 for row in rows if row.get("market_cache_live"))
+            feed_status = "GREEN" if live_feed_count == len(rows) else ("AMBER" if live_feed_count else "RED")
+            feed_label = f"{live_feed_count}/{len(rows)} symbols live from websocket cache" if rows else "No symbols configured"
             health_rows = [
-                ("Data Ingestion", "Market feeds available" if any(r["price"] for r in rows) else "No market feed", "GREEN" if any(r["price"] for r in rows) else "RED"),
+                ("Data Ingestion", feed_label, feed_status),
                 ("Model & Signals", "Model active" if model else "Learning or fallback mode", "GREEN" if model else "AMBER"),
                 ("Execution", "No order issues", "GREEN"),
                 ("Risk Controls", risk.get("status", "UNKNOWN"), "GREEN" if risk.get("status") == "RISK_OK" else "RED"),
